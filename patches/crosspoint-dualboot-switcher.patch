@@ -1,0 +1,130 @@
+diff --git a/lib/I18n/translations/english.yaml b/lib/I18n/translations/english.yaml
+index 81d3eddf..9920c11a 100644
+--- a/lib/I18n/translations/english.yaml
++++ b/lib/I18n/translations/english.yaml
+@@ -664,3 +664,6 @@ STR_BT_HOLD: "hold"
+ STR_BT_MAPPING_CLEARED: "Mapping cleared"
+ STR_DELETE_ITEM_CONFIRM: "Delete?"
+ STR_SET_SLEEP_COVER_CONFIRM: "Set Sleep Cover?"
++STR_SWITCHING_PARTITION: "Switching boot partition..."
++STR_NO_ALT_FIRMWARE: "No valid firmware in alternate slot"
++STR_SWITCH_FIRMWARE_SLOT: "Switch Boot Partition"
+diff --git a/src/activities/settings/SettingsActivity.cpp b/src/activities/settings/SettingsActivity.cpp
+index 8938844b..7f69a2c4 100644
+--- a/src/activities/settings/SettingsActivity.cpp
++++ b/src/activities/settings/SettingsActivity.cpp
+@@ -40,6 +40,7 @@
+ #include "components/UIThemeTokens.h"
+ #include "components/UiAppHelpers.h"
+ #include "fontIds.h"
++#include "network/OtaBootSwitch.h"
+ #include "util/PluginEvents.h"
+ 
+ namespace fui = freeink::ui;
+@@ -81,7 +82,7 @@ SettingsSection sectionFor(const SettingInfo& setting) {
+ }
+ 
+ // Device-only action rows added per section, beyond the shared list.
+-constexpr size_t EXTRA_ROWS_PER_SECTION = 6;
++constexpr size_t EXTRA_ROWS_PER_SECTION = 7;
+ }  // namespace
+ 
+ void SettingsActivity::rebuildSettings() {
+@@ -145,6 +146,9 @@ void SettingsActivity::rebuildSettings() {
+   if (!BoardConfig::isPicco()) {
+     addAction(SettingsSection::General, StrId::STR_CHECK_UPDATES, SettingAction::CheckForUpdates);
+     addAction(SettingsSection::General, StrId::STR_SD_FIRMWARE_UPDATE, SettingAction::SdFirmwareUpdate);
++    if (section == SettingsSection::General && ota_boot::hasBootableNextPartition()) {
++      addAction(SettingsSection::General, StrId::STR_SWITCH_FIRMWARE_SLOT, SettingAction::SwitchFirmwareSlot);
++    }
+   }
+   addAction(SettingsSection::General, StrId::STR_ABOUT, SettingAction::About);
+   rebuildRowItems();
+@@ -399,6 +403,19 @@ void SettingsActivity::toggleSelectedSetting() {
+           LOG_ERR("SETTINGS", "OOM: KeyboardLayoutsActivity");
+         }
+         break;
++      case SettingAction::SwitchFirmwareSlot:
++        if (ota_boot::switchToNextPartition()) {
++          RenderLock lock;
++          GUI.drawPopup(renderer, tr(STR_SWITCHING_PARTITION));
++          delay(250);
++          ESP.restart();
++        } else {
++          RenderLock lock;
++          GUI.drawPopup(renderer, tr(STR_NO_ALT_FIRMWARE));
++          delay(800);
++          requestUpdate();
++        }
++        break;
+       case SettingAction::About:
+         if (auto activity = makeUniqueNoThrow<AboutActivity>(renderer, mappedInput)) {
+           startActivityForResult(std::move(activity), nullptr);
+diff --git a/src/activities/settings/SettingsActivity.h b/src/activities/settings/SettingsActivity.h
+index 56b6b5ca..4a82a101 100644
+--- a/src/activities/settings/SettingsActivity.h
++++ b/src/activities/settings/SettingsActivity.h
+@@ -31,6 +31,7 @@ enum class SettingAction {
+   Plugins,
+   KeyboardLayouts,
+   HomeButton,
++  SwitchFirmwareSlot,
+   About,
+ };
+ 
+diff --git a/src/main.cpp b/src/main.cpp
+index 65b4aed3..9c38d2e2 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -23,6 +23,7 @@
+ #include <XteinkDetect.h>
+ #include <builtinFonts/all.h>
+ #include <esp_heap_caps.h>
++#include <esp_system.h>
+ #include <esp_wifi.h>
+ #include <time.h>
+ 
+@@ -45,6 +46,7 @@
+ #include "activities/settings/SdFirmwareUpdateActivity.h"
+ #include "components/UITheme.h"
+ #include "fontIds.h"
++#include "network/OtaBootSwitch.h"
+ #include "platform/UsbSerialJtagHandoff.h"
+ #include "util/ButtonNavigator.h"
+ #include "util/PluginEvents.h"
+@@ -623,6 +625,12 @@ void setup() {
+   // The Picco has no second app slot to flash into (partitions_picco.csv).
+   const bool recoveryFirmwareMode = wakeupReason == HalGPIO::WakeupReason::PowerButton && !BoardConfig::isPaperMono() &&
+                                     !BoardConfig::isPicco() && mappedInputManager.isPressed(recoveryButton);
++  const bool powerWakeOrUsbPower = (wakeupReason == HalGPIO::WakeupReason::PowerButton) ||
++                                   (wakeupReason == HalGPIO::WakeupReason::AfterUSBPower &&
++                                    gpio.isPressed(HalGPIO::BTN_POWER));
++  const bool switchPartitionMode = powerWakeOrUsbPower && esp_reset_reason() != ESP_RST_SW &&
++                                   !BoardConfig::isPaperMono() && !BoardConfig::isPicco() &&
++                                   !recoveryFirmwareMode && gpio.isPressed(HalGPIO::BTN_LEFT);
+ 
+   halTiltSensor.begin();
+   halClock.begin();
+@@ -790,6 +798,22 @@ void setup() {
+   // Output polarity is resolved per render by ActivityManager (night mode
+   // inverts only the reading surfaces), so nothing to restore here.
+ 
++  if (switchPartitionMode) {
++    LOG_INF("MAIN", "Switch partition mode (LEFT + POWER held at boot)");
++    if (ota_boot::switchToNextPartition()) {
++      RenderLock lock;
++      GUI.drawPopup(renderer, tr(STR_SWITCHING_PARTITION));
++      delay(250);
++      ESP.restart();
++    } else {
++      RenderLock lock;
++      GUI.drawPopup(renderer, tr(STR_NO_ALT_FIRMWARE));
++      delay(800);
++      needsWakeRefresh = true;
++      allowFastInitialReaderRefresh = false;
++    }
++  }
++
+   if (recoveryFirmwareMode) {
+     // Skip normal home/reader routing: jump straight into the SD firmware picker.
+     activityManager.replaceActivity(

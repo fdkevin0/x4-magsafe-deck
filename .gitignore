@@ -1,0 +1,12 @@
+.pio/
+.cache/
+.dummy/
+managed_components/
+sdkconfig.*
+build/
+dist/*.bin
+dist/manifest.json
+__pycache__/
+*.pyc
+.DS_Store
+platformio.local.ini

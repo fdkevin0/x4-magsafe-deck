@@ -1,0 +1,16 @@
+BasedOnStyle: Google
+IndentWidth: 2
+ColumnLimit: 120
+SortIncludes: CaseSensitive
+IncludeBlocks: Regroup
+IncludeCategories:
+  # Main header file happens automatically (`IncludeIsMainRegex`)
+  # Standard C/C++ library headers (no file extension or .h extension in angle brackets)
+  - Regex:           '^<([a-zA-Z0-9_-]+|[a-zA-Z0-9_-]+\.h)>$'
+    Priority:        1
+  # External libraries
+  - Regex:           '^<.*'
+    Priority:        2
+  # Project headers
+  - Regex:           '.*'
+    Priority:        3

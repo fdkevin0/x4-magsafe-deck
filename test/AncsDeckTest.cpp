@@ -1,0 +1,355 @@
+#include <gtest/gtest.h>
+
+#include <array>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "Utf8.h"
+#include "network/AncsProtocol.h"
+#include "network/FirmwareBoardTag.h"
+#include "network/FirmwareImageVerify.h"
+#include "network/MagSafeBadgeStore.h"
+#include "util/StringUtils.h"
+
+namespace {
+
+void appendAttr(std::vector<uint8_t>& pkt, ancs::AttributeId id, const std::string& val) {
+  pkt.push_back(static_cast<uint8_t>(id));
+  const uint16_t len = static_cast<uint16_t>(val.size());
+  pkt.push_back(static_cast<uint8_t>(len & 0xFF));
+  pkt.push_back(static_cast<uint8_t>((len >> 8) & 0xFF));
+  pkt.insert(pkt.end(), val.begin(), val.end());
+}
+
+struct VectorReadCtx {
+  const std::vector<uint8_t>* data;
+  size_t pos = 0;
+};
+
+bool readFromVector(void* ctx, uint8_t* buf, size_t len) {
+  auto* vctx = static_cast<VectorReadCtx*>(ctx);
+  if (vctx->pos + len > vctx->data->size()) return false;
+  std::memcpy(buf, vctx->data->data() + vctx->pos, len);
+  vctx->pos += len;
+  return true;
+}
+
+std::vector<uint8_t> buildSyntheticEspImage(uint16_t chipId, const std::string& embeddedTag, bool appendSha = true,
+                                            size_t segPayloadLen = 65536) {
+  std::vector<uint8_t> img(24, 0);
+  img[0] = 0xE9;  // magic
+  img[1] = 1;     // 1 segment
+  const uint32_t entry = 0x40380000u;
+  std::memcpy(&img[4], &entry, sizeof(entry));
+  std::memcpy(&img[12], &chipId, sizeof(chipId));
+  img[23] = appendSha ? 1 : 0;
+
+  uint8_t segHdr[8] = {};
+  const uint32_t loadAddr = 0x3C000020u;
+  const uint32_t dataLen = static_cast<uint32_t>(segPayloadLen);
+  std::memcpy(segHdr, &loadAddr, 4);
+  std::memcpy(segHdr + 4, &dataLen, 4);
+  img.insert(img.end(), segHdr, segHdr + 8);
+
+  std::vector<uint8_t> payload(segPayloadLen, 0x5Au);
+  if (!embeddedTag.empty() && embeddedTag.size() < payload.size()) {
+    std::memcpy(payload.data() + 128, embeddedTag.data(), embeddedTag.size());
+  }
+
+  uint8_t xorAcc = 0xEFu;
+  for (uint8_t b : payload) {
+    xorAcc ^= b;
+  }
+  img.insert(img.end(), payload.begin(), payload.end());
+
+  const size_t padEnd = (img.size() + 16) & ~static_cast<size_t>(15);
+  const size_t padLen = padEnd - img.size();
+  img.insert(img.end(), padLen, 0x00u);
+  img.back() = xorAcc;
+
+  if (appendSha) {
+    uint8_t digest[32] = {};
+    mbedtls_sha256_context sha;
+    mbedtls_sha256_init(&sha);
+    mbedtls_sha256_starts(&sha, 0);
+    mbedtls_sha256_update(&sha, img.data(), img.size());
+    mbedtls_sha256_finish(&sha, digest);
+    mbedtls_sha256_free(&sha);
+    img.insert(img.end(), digest, digest + 32);
+  }
+  return img;
+}
+
+}  // namespace
+
+TEST(AncsProtocolTest, Parses8ByteNotificationSourcePacket) {
+  const uint8_t raw[8] = {
+      0x00,                    // EventId::Added
+      0x18,                    // Positive + Negative Action flags
+      0x04,                    // Category Social
+      0x02,                    // CategoryCount
+      0x78, 0x56, 0x34, 0x12,  // UID = 0x12345678
+  };
+  ancs::NotificationSourceEvent ev{};
+  ASSERT_TRUE(ancs::parseNotificationSourcePacket(raw, sizeof(raw), ev));
+  EXPECT_EQ(ev.eventId, ancs::EventId::Added);
+  EXPECT_EQ(ev.eventFlags, 0x18);
+  EXPECT_EQ(ev.categoryId, 4);
+  EXPECT_EQ(ev.categoryCount, 2);
+  EXPECT_EQ(ev.uid, 0x12345678U);
+
+  const uint8_t bad[8] = {0x05, 0, 0, 0, 0, 0, 0, 0};
+  EXPECT_FALSE(ancs::parseNotificationSourcePacket(bad, sizeof(bad), ev));
+  EXPECT_FALSE(ancs::parseNotificationSourcePacket(raw, 7, ev));
+}
+
+TEST(AncsProtocolTest, BuildsGetNotificationAttributesAndPerformActionRequests) {
+  uint8_t pkt[ancs::kGetAttributesRequestSize] = {};
+  const size_t len = ancs::buildGetNotificationAttributesPacket(0xAABBCCDDU, pkt);
+  ASSERT_EQ(len, 13U);
+  EXPECT_EQ(pkt[0], static_cast<uint8_t>(ancs::CommandId::GetNotificationAttributes));
+  uint32_t uid = 0;
+  std::memcpy(&uid, pkt + 1, sizeof(uint32_t));
+  EXPECT_EQ(uid, 0xAABBCCDDU);
+  EXPECT_EQ(pkt[5], static_cast<uint8_t>(ancs::AttributeId::AppIdentifier));
+  EXPECT_EQ(pkt[6], static_cast<uint8_t>(ancs::AttributeId::Title));
+  EXPECT_EQ(pkt[9], static_cast<uint8_t>(ancs::AttributeId::Message));
+  EXPECT_EQ(pkt[12], static_cast<uint8_t>(ancs::AttributeId::Date));
+
+  uint8_t actPkt[ancs::kPerformActionRequestSize] = {};
+  ASSERT_EQ(ancs::buildPerformActionPacket(0x11223344U, ancs::ActionId::Positive, actPkt), 6U);
+  EXPECT_EQ(actPkt[0], static_cast<uint8_t>(ancs::CommandId::PerformNotificationAction));
+  std::memcpy(&uid, actPkt + 1, sizeof(uint32_t));
+  EXPECT_EQ(uid, 0x11223344U);
+  EXPECT_EQ(actPkt[5], static_cast<uint8_t>(ancs::ActionId::Positive));
+}
+
+TEST(AncsProtocolTest, Utf8SafeTruncateHandlesBoundaryAndStrayContinuationBytes) {
+  // 1. Buffer containing only stray continuation bytes (i == 0).
+  char strayOnly[8] = {'\x80', '\xBF', '\x80', '\0'};
+  EXPECT_EQ(ancs::utf8SafeTruncate(strayOnly, 3), 0U);
+  EXPECT_STREQ(strayOnly, "");
+  EXPECT_EQ(utf8SafeTruncateBuffer("\x80\xBF", 2), 0);
+
+  // 2. Buffer starting with an incomplete 3-byte sequence at index 0.
+  char incompleteAtZero[4] = {'\xE4', '\xB8', '\0'};
+  EXPECT_EQ(ancs::utf8SafeTruncate(incompleteAtZero, 2), 0U);
+  EXPECT_STREQ(incompleteAtZero, "");
+  EXPECT_EQ(utf8SafeTruncateBuffer("\xE4\xB8", 2), 0);
+
+  // 3. Valid 3-byte CJK character followed by 4 stray continuation bytes (len - i == 4).
+  char fourStrayTail[16] = {'a', '\xE4', '\xB8', '\xAD', '\x80', '\x80', '\x80', '\x80', '\0'};
+  EXPECT_EQ(ancs::utf8SafeTruncate(fourStrayTail, 8), 4U);
+  EXPECT_STREQ(fourStrayTail, "a\xE4\xB8\xAD");
+
+  // 4. Incomplete 4-byte emoji split at tail.
+  char splitEmoji[8] = {'O', 'K', '\xF0', '\x9F', '\x98', '\0'};
+  EXPECT_EQ(ancs::utf8SafeTruncate(splitEmoji, 5), 2U);
+  EXPECT_STREQ(splitEmoji, "OK");
+}
+
+TEST(AncsProtocolTest, ReassemblesFragmentedDataSourceStreamAndTruncatesUtf8Safely) {
+  std::vector<uint8_t> stream;
+  stream.push_back(0x00);
+  const uint32_t uid = 42;
+  stream.push_back(static_cast<uint8_t>(uid & 0xFF));
+  stream.push_back(0);
+  stream.push_back(0);
+  stream.push_back(0);
+
+  const std::string longAppId = "com.example.enterprise.super.long.bundle.identifier.tencent.xin";
+  appendAttr(stream, ancs::AttributeId::AppIdentifier, longAppId);
+  appendAttr(stream, ancs::AttributeId::Title, "微信消息");
+
+  std::string longMsg;
+  for (int i = 0; i < 80; ++i) {
+    longMsg += "墨水屏";
+  }
+  appendAttr(stream, ancs::AttributeId::Message, longMsg);
+  appendAttr(stream, ancs::AttributeId::Date, "20261105T233512");
+
+  ancs::AncsDataSourceParser parser;
+  ancs::AncsNotification completed{};
+  bool done = false;
+
+  auto cb = +[](const ancs::AncsNotification& item, void* ctx) {
+    auto* out = static_cast<ancs::AncsNotification*>(ctx);
+    *out = item;
+  };
+
+  for (size_t i = 0; i < stream.size(); ++i) {
+    parser.feed(&stream[i], 1, cb, &completed);
+    if (completed.valid) {
+      done = true;
+    }
+  }
+
+  ASSERT_TRUE(done);
+  EXPECT_EQ(completed.uid, 42U);
+  EXPECT_STREQ(completed.title, "微信消息");
+  EXPECT_STREQ(completed.date, "20261105T233512");
+
+  char formattedTime[8];
+  ancs::formatAncsTime(completed.date, formattedTime);
+  EXPECT_STREQ(formattedTime, "23:35");
+
+  const size_t msgLen = std::strlen(completed.message);
+  EXPECT_GT(msgLen, 0U);
+  EXPECT_LT(msgLen, ancs::AncsNotification::kMessageMax);
+  EXPECT_EQ(msgLen % 3U, 0U);
+}
+
+TEST(AncsProtocolTest, RejectsMalformedCommandAndOversizedAttributeHeaders) {
+  ancs::AncsDataSourceParser parser;
+  ancs::AncsNotification completed{};
+  auto cb = +[](const ancs::AncsNotification& item, void* ctx) {
+    *static_cast<ancs::AncsNotification*>(ctx) = item;
+  };
+
+  // Packet starting with non-zero command byte must be discarded without hunting for an embedded 0x00.
+  const uint8_t bogusPacket[] = {0x99, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 'H', 'i'};
+  parser.feed(bogusPacket, sizeof(bogusPacket), cb, &completed);
+  EXPECT_EQ(parser.phase(), ancs::AncsDataSourceParser::ParsePhase::CommandId);
+  EXPECT_FALSE(completed.valid);
+
+  // Packet with invalid AttributeId (0xFE) or attrLen > kMaxWireAttributeLen resets cleanly.
+  const uint8_t badAttrPacket[] = {0x00, 0x01, 0x00, 0x00, 0x00, 0xFE, 0x10, 0x00};
+  parser.feed(badAttrPacket, sizeof(badAttrPacket), cb, &completed);
+  EXPECT_EQ(parser.phase(), ancs::AncsDataSourceParser::ParsePhase::CommandId);
+}
+
+TEST(AncsProtocolTest, HandlesZeroLengthAttributesCleanly) {
+  std::vector<uint8_t> stream = {0x00, 0x07, 0x00, 0x00, 0x00};
+  appendAttr(stream, ancs::AttributeId::AppIdentifier, "com.apple.MobileSMS");
+  appendAttr(stream, ancs::AttributeId::Title, "");
+  appendAttr(stream, ancs::AttributeId::Message, "Verification code: 849201");
+  appendAttr(stream, ancs::AttributeId::Date, "");
+
+  ancs::AncsDataSourceParser parser;
+  ancs::AncsNotification completed{};
+  parser.feed(
+      stream.data(), stream.size(),
+      +[](const ancs::AncsNotification& item, void* ctx) { *static_cast<ancs::AncsNotification*>(ctx) = item; },
+      &completed);
+
+  ASSERT_TRUE(completed.valid);
+  EXPECT_EQ(completed.uid, 7U);
+  EXPECT_STREQ(ancs::friendlyAppName(completed.appId), "Messages");
+  EXPECT_STREQ(completed.title, "");
+  EXPECT_STREQ(completed.message, "Verification code: 849201");
+}
+
+TEST(MagSafeBadgeStoreTest, Parses2To5FieldPipeDelimitedCardsAndDefaults) {
+  const char* sample =
+      "# Comment line\n"
+      "BOARDING PASS | MU5101 PEK->SHA | GATE A08 SEAT 16K | BOARD 08:30 | M1TEST/PASSENGER\n"
+      "DIGITAL CARD | XTEINK X4 | Zero-Power Companion | https://crosspointreader.com\n"
+      "EMERGENCY ICE | IF FOUND CALL | tel:+8613800000000\n"
+      "Quick WiFi | WIFI:S:Guest;T:WPA;P:secret;;\n";
+
+  std::array<magsafe_badge::BadgeCard, 6> cards{};
+  const size_t n = magsafe_badge::parseCardsText(sample, cards);
+  ASSERT_EQ(n, 4U);
+
+  EXPECT_STREQ(cards[0].tag, "BOARDING PASS");
+  EXPECT_STREQ(cards[0].title, "MU5101 PEK->SHA");
+  EXPECT_STREQ(cards[0].subtitle, "GATE A08 SEAT 16K");
+  EXPECT_STREQ(cards[0].meta, "BOARD 08:30");
+  EXPECT_STREQ(cards[0].qrPayload, "M1TEST/PASSENGER");
+
+  EXPECT_STREQ(cards[1].tag, "DIGITAL CARD");
+  EXPECT_STREQ(cards[1].title, "XTEINK X4");
+  EXPECT_STREQ(cards[1].subtitle, "Zero-Power Companion");
+  EXPECT_STREQ(cards[1].meta, "");
+  EXPECT_STREQ(cards[1].qrPayload, "https://crosspointreader.com");
+
+  EXPECT_STREQ(cards[2].tag, "EMERGENCY ICE");
+  EXPECT_STREQ(cards[2].title, "IF FOUND CALL");
+  EXPECT_STREQ(cards[2].qrPayload, "tel:+8613800000000");
+
+  EXPECT_STREQ(cards[3].tag, "MAGSAFE VAULT");
+  EXPECT_STREQ(cards[3].title, "Quick WiFi");
+  EXPECT_STREQ(cards[3].qrPayload, "WIFI:S:Guest;T:WPA;P:secret;;");
+
+  magsafe_badge::BadgeCard def0{}, def1{};
+  magsafe_badge::populateDefaultCards(def0, def1);
+  EXPECT_STREQ(def0.tag, "DIGITAL BADGE");
+  EXPECT_STREQ(def1.tag, "BOARDING PASS");
+}
+
+TEST(FirmwareBoardTagTest, ScannerDetectsMatchingMismatchedAndFalsePrefixTags) {
+  EXPECT_EQ(std::string(board_tag::boardName(), board_tag::boardNameLen()), "x4");
+
+  // 1. Matching tag split byte-by-byte across chunks.
+  board_tag::Scanner okScanner;
+  const std::string validStream = "padding...CROSSPOINT-BOARD-V1:x4;...tail";
+  for (char c : validStream) {
+    const uint8_t b = static_cast<uint8_t>(c);
+    okScanner.feed(&b, 1);
+  }
+  EXPECT_FALSE(okScanner.mismatch());
+
+  // 2. False prefix collision aborted by non-printable byte '\x01' followed immediately by real mismatch tag.
+  board_tag::Scanner collisionScanner;
+  const std::string tricky = "CROSSPOINT-BOARD-V1:bad\x01" "CROSSPOINT-BOARD-V1:x4pro;";
+  collisionScanner.feed(reinterpret_cast<const uint8_t*>(tricky.data()), tricky.size());
+  EXPECT_TRUE(collisionScanner.mismatch());
+  EXPECT_STREQ(collisionScanner.foundName(), "x4pro");
+}
+
+TEST(FirmwareImageVerifyTest, ValidatesHeaderChecksumSha256AndBoardTag) {
+  constexpr uint16_t kEsp32C3ChipId = 0x0005;
+
+  // 1. Valid image with matching board tag and SHA-256 trailer.
+  const auto validImg = buildSyntheticEspImage(kEsp32C3ChipId, "CROSSPOINT-BOARD-V1:x4;", /*appendSha=*/true);
+  VectorReadCtx ctx{&validImg, 0};
+  board_tag::Scanner scanner;
+  EXPECT_EQ(firmware_flash::detail::validateImageStream(readFromVector, &ctx, validImg.size(), /*exactSize=*/true,
+                                                        kEsp32C3ChipId, &scanner),
+            firmware_flash::Result::OK);
+
+  // 2. Wrong chip ID rejected.
+  ctx.pos = 0;
+  EXPECT_EQ(firmware_flash::detail::validateImageStream(readFromVector, &ctx, validImg.size(), /*exactSize=*/true,
+                                                        /*expectedChipId=*/0x0009, nullptr),
+            firmware_flash::Result::BAD_CHIP);
+
+  // 3. Mismatched board tag rejected.
+  const auto wrongBoardImg = buildSyntheticEspImage(kEsp32C3ChipId, "CROSSPOINT-BOARD-V1:x4pro;", /*appendSha=*/true);
+  VectorReadCtx wbCtx{&wrongBoardImg, 0};
+  board_tag::Scanner wbScanner;
+  EXPECT_EQ(firmware_flash::detail::validateImageStream(readFromVector, &wbCtx, wrongBoardImg.size(),
+                                                        /*exactSize=*/true, kEsp32C3ChipId, &wbScanner),
+            firmware_flash::Result::WRONG_BOARD);
+
+  // 4. Corrupted SHA-256 trailer rejected.
+  auto badShaImg = validImg;
+  badShaImg.back() ^= 0xFFu;
+  VectorReadCtx shaCtx{&badShaImg, 0};
+  EXPECT_EQ(firmware_flash::detail::validateImageStream(readFromVector, &shaCtx, badShaImg.size(), /*exactSize=*/true,
+                                                        kEsp32C3ChipId, nullptr),
+            firmware_flash::Result::BAD_SHA);
+
+  // 5. Corrupted XOR checksum byte rejected.
+  auto badXorImg = buildSyntheticEspImage(kEsp32C3ChipId, "CROSSPOINT-BOARD-V1:x4;", /*appendSha=*/false);
+  badXorImg.back() ^= 0x01u;
+  VectorReadCtx xorCtx{&badXorImg, 0};
+  EXPECT_EQ(firmware_flash::detail::validateImageStream(readFromVector, &xorCtx, badXorImg.size(), /*exactSize=*/true,
+                                                        kEsp32C3ChipId, nullptr),
+            firmware_flash::Result::BAD_CHECKSUM);
+
+  // 6. Unaligned segment length (not a multiple of 4) rejected.
+  auto unalignedImg = buildSyntheticEspImage(kEsp32C3ChipId, "", /*appendSha=*/false, /*segPayloadLen=*/65538);
+  VectorReadCtx unalignedCtx{&unalignedImg, 0};
+  EXPECT_EQ(firmware_flash::detail::validateImageStream(readFromVector, &unalignedCtx, unalignedImg.size(),
+                                                        /*exactSize=*/true, kEsp32C3ChipId, nullptr),
+            firmware_flash::Result::BAD_SEGMENTS);
+}
+
+TEST(StringUtilsTest, AsciiCaseCmpComparesCaseInsensitively) {
+  EXPECT_EQ(StringUtils::asciiCaseCmp(".BMP", ".bmp"), 0);
+  EXPECT_EQ(StringUtils::asciiCaseCmp(".Json", ".JSON"), 0);
+  EXPECT_LT(StringUtils::asciiCaseCmp("abc", "abd"), 0);
+  EXPECT_GT(StringUtils::asciiCaseCmp("abd", "ABC"), 0);
+}
