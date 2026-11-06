@@ -23,6 +23,10 @@ By leveraging the X4's 16 MB dual-OTA partition table (`app0` @ `0x010000` + `ap
    - Renders high-contrast QR codes (`ricmoo/QRCode`, auto-selecting Byte-mode QR versions 4–40) + pass metadata (`Tag`, `Title`, `Subtitle`, `Meta`).
    - **Zero-Power Lock (`Lock Pass & Sleep`)**: Press **`Confirm`** on the Badge Vault tab (or after 20 minutes of inactivity) to perform a clean `FULL_REFRESH` and immediately enter ESP32-C3 deep sleep while retaining the E-Ink image at **0 W** power consumption—keeping boarding passes, train tickets, and contact QR badges scannable even if the battery is completely depleted.
 
+4. **Shared CJK / Non-Latin Font Library with CrossPoint Reader**
+   - Automatically discovers and shares the MicroSD font directories (`/.fonts` and `/fonts`) and user font selection (`/.crosspoint/settings.json` → `"sdFontFamilyName"`) with **CrossPoint Reader** (`app0`).
+   - Supports both pre-rasterized **`.cpfont`** families (`SdCardFont`) and streamed **`.ttf` / `.otf` / `.ttc`** vector fonts (`TtfEpdFont`), registering size-matched CJK fallbacks for `UI_10_FONT_ID` and `UI_12_FONT_ID` so Chinese/Japanese/Korean iOS notifications and MagSafe badges render natively without duplicating font files on the SD card.
+
 ---
 
 ## Repository Layout
@@ -44,6 +48,7 @@ x4-magsafe-deck/
 │   │   ├── FirmwareBoardTag.{h,cpp}        # Streaming CROSSPOINT-BOARD-V1:<board>; tag scanner
 │   │   ├── FirmwareImageVerify.h           # Streaming OTA partition checksum & SHA-256 verifier
 │   │   ├── OtaBootSwitch.{h,cpp}           # Safe otadata dual-partition boot switcher
+│   │   ├── SharedFontLoader.{h,cpp}        # Shared CrossPoint SD card CJK/.cpfont/.ttf fallback loader
 │   │   └── FirmwareFlasher.{h,cpp}         # SD-card firmware.bin -> inactive OTA slot flasher
 │   ├── platform/
 │   │   ├── UsbSerialJtagHandoff.{h,cpp}    # ESP32-C3 USB Serial/JTAG boot handoff

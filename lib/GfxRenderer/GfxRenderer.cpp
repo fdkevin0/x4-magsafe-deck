@@ -341,10 +341,8 @@ void GfxRenderer::prewarmFallbackText(const int fontId, const char* text, const 
   if (text == nullptr || *text == '\0') {
     return;
   }
-  const int resolvedFontId = resolveTextFontId(fontId, text, style);
-  if (resolvedFontId != fontId) {
-    ensureSdGlyphsResident(resolvedFontId, text, style, false);
-  }
+  const auto singleGetter = [](const void* ctx, uint32_t) -> const char* { return static_cast<const char*>(ctx); };
+  prewarmFallbackText(fontId, singleGetter, text, 1, style);
 }
 
 void GfxRenderer::ensureSdGlyphsResident(const int fontId, const char* text, const EpdFontFamily::Style style,
@@ -1823,6 +1821,7 @@ std::string GfxRenderer::truncatedText(const int fontId, const char* text, const
                                        const EpdFontFamily::Style style) const {
   if (!text || maxWidth <= 0) return "";
 
+  prewarmFallbackText(fontId, text, style);
   std::string item = text;
   // U+2026 HORIZONTAL ELLIPSIS (UTF-8: 0xE2 0x80 0xA6)
   const char* ellipsis = "\xe2\x80\xa6";
@@ -1872,6 +1871,7 @@ std::vector<std::string> GfxRenderer::wrappedText(const int fontId, const char* 
 
   if (!text || maxWidth <= 0 || maxLines <= 0) return lines;
 
+  prewarmFallbackText(fontId, text, style);
   std::string remaining = text;
   std::string currentLine;
 

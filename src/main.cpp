@@ -28,6 +28,7 @@
 #include "network/IosAncsService.h"
 #include "network/MagSafeBadgeStore.h"
 #include "network/OtaBootSwitch.h"
+#include "network/SharedFontLoader.h"
 #include "util/QrUtils.h"
 #include "util/StringUtils.h"
 
@@ -67,6 +68,7 @@ ancs::AncsNotification g_currentNotif{};
 size_t g_notifCount = 0;
 IosAncsService::State g_ancsState = IosAncsService::State::Stopped;
 std::array<magsafe_badge::BadgeCard, kMaxBadges> g_badges{};
+SharedFontLoader g_sharedFonts{};
 
 bool hasExtension(const char* name, const char* ext) {
   if (!name || !ext) return false;
@@ -371,6 +373,7 @@ void lockPassAndDeepSleep() {
   IosAncsService::getInstance().end();
   renderDeckFrame(/*cleanLockFrame=*/true);
 
+  g_sharedFonts.unload(renderer);
   display.deepSleep();
   Storage.prepareForDeepSleep();
   gpio.prepareForDeepSleep();
@@ -381,6 +384,7 @@ void switchBackToReaderPartition() {
   IosAncsService::getInstance().end();
   if (ota_boot::switchToNextPartition()) {
     drawPopupMessage("Switching boot partition...");
+    g_sharedFonts.unload(renderer);
     delay(250);
     ESP.restart();
   } else {
@@ -434,6 +438,7 @@ void setup() {
     switchBackToReaderPartition();
   }
 
+  g_sharedFonts.begin(renderer);
   loadBadgesFromSd();
 
   if (IosAncsService::getInstance().begin("X4-MagSafe")) {
