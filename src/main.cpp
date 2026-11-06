@@ -211,8 +211,12 @@ void renderNotificationsTab(const int pageWidth, const int pageHeight) {
   const int cardWidth = pageWidth - margin * 2;
 
   if (g_notifCount == 0 || !g_currentNotif.valid) {
-    const int centerY = (contentTop + contentBottom) / 2 - 16;
-    renderer.drawCenteredText(UI_12_FONT_ID, centerY, statusSub, true, EpdFontFamily::BOLD);
+    renderer.drawRect(margin, contentTop, cardWidth, contentBottom - contentTop, 2, true);
+    const int centerY = (contentTop + contentBottom) / 2 - 28;
+    const char* emptyTitle =
+        (g_ancsState == IosAncsService::State::SubscribedReady) ? "All Caught Up" : "Waiting for iPhone ANCS";
+    renderer.drawCenteredText(UI_12_FONT_ID, centerY, emptyTitle, true, EpdFontFamily::BOLD);
+    renderer.drawCenteredText(UI_10_FONT_ID, centerY + 34, statusSub, true, EpdFontFamily::REGULAR);
     return;
   }
 
@@ -354,7 +358,7 @@ void renderDeckFrame(const bool cleanLockFrame = false) {
     renderNotificationsTab(pageWidth, pageHeight);
     const bool hasPos = g_notifCount > 0 && g_currentNotif.valid &&
                         (g_currentNotif.eventFlags & ancs::kEventFlagPositiveAction) != 0;
-    drawBottomButtonHints(pageWidth, pageHeight, "Reader", hasPos ? "Dismiss/Pwr:OK" : "Dismiss", "Tab", "Next");
+    drawBottomButtonHints(pageWidth, pageHeight, "Reader", hasPos ? "Dismiss / OK" : "Dismiss", "Tab", "Next");
   } else {
     renderBadgeVaultTab(pageWidth, pageHeight, /*cleanLockFrame=*/false);
     drawBottomButtonHints(pageWidth, pageHeight, "Reader", "Lock Pass", "Tab", "Next");
