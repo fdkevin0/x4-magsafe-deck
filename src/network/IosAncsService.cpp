@@ -11,7 +11,10 @@
 
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
+
+#include <esp_heap_caps.h>
 
 #include "AncsNotificationList.h"
 
@@ -198,6 +201,15 @@ class AncsServerCallbacks : public NimBLEServerCallbacks {
 
 AncsServerCallbacks g_serverCallbacks;
 
+char g_lastError[64] = {0};
+
+void setLastError(const char* what) {
+  // Free internal heap is the usual culprit on the no-PSRAM ESP32-C3, so record it with the reason.
+  const unsigned freeKb = static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024);
+  std::snprintf(g_lastError, sizeof(g_lastError), "%s (free heap %u KB)", what, freeKb);
+  LOG_ERR("ANCS", "%s", g_lastError);
+}
+
 void startAdvertisingAncs(const char* deviceName) {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   if (!adv) return;
@@ -278,6 +290,7 @@ IosAncsService& IosAncsService::getInstance() {
 
 bool IosAncsService::begin(const char* deviceName) {
   if (g_running.load()) return true;
+  g_lastError[0] = '\0';
 
   if (!g_ancsMutex) {
     g_ancsMutex = xSemaphoreCreateMutexStatic(&g_ancsMutexStorage);
@@ -290,7 +303,7 @@ bool IosAncsService::begin(const char* deviceName) {
   }
 
   if (!NimBLEDevice::init(deviceName ? deviceName : "X4-MagSafe")) {
-    LOG_ERR("ANCS", "NimBLEDevice::init failed");
+    setLastError("Bluetooth init failed");
     return false;
   }
 
@@ -304,7 +317,7 @@ bool IosAncsService::begin(const char* deviceName) {
 
   g_server = NimBLEDevice::createServer();
   if (!g_server) {
-    LOG_ERR("ANCS", "createServer failed");
+    setLastError("BLE server create failed");
     NimBLEDevice::deinit(true);
     return false;
   }
@@ -517,6 +530,8 @@ void IosAncsService::poll() {
 
 IosAncsService::State IosAncsService::state() const { return g_state.load(); }
 
+const char* IosAncsService::lastError() const { return g_lastError; }
+
 bool IosAncsService::isConnected() const {
   const State s = g_state.load();
   return s == State::ConnectedAuthenticating || s == State::DiscoveringAncs || s == State::SubscribedReady;
@@ -633,15 +648,13 @@ void IosAncsService::onNotificationSourceBytes(const uint8_t* data, size_t len) 
   ancs::NotificationSourceEvent ev{};
   if (!ancs::parseNotificationSourcePacket(data, len, ev)) return;
 
-  if ((ev.eventFlags & ancs::kEventFlagSilent) != 0 && ev.eventId == ancs::EventId::Added) {
-    return;
-  }
-
   ScopedLock lock;
   switch (ev.eventId) {
     case ancs::EventId::Added:
     case ancs::EventId::Modified:
-      enqueuePendingUidLocked(ev.uid, ev.categoryId, ev.eventFlags);
+      if (ancs::shouldFetchAttributes(ev)) {
+        enqueuePendingUidLocked(ev.uid, ev.categoryId, ev.eventFlags);
+      }
       break;
     case ancs::EventId::Removed:
       removeUidLocked(ev.uid);
@@ -655,6 +668,13 @@ void IosAncsService::onDataSourceBytes(const uint8_t* data, size_t len) {
   if (!data || len == 0) return;
   ScopedLock lock;
   if (!g_requestInFlight) {
+    return;
+  }
+  // At a response boundary, only accept the header of the response we are waiting for. A late
+  // fragment of a previously timed-out response would otherwise be parsed as a new header and could
+  // desynchronize the parser for the real response.
+  if (g_parser.phase() == ancs::AncsDataSourceParser::ParsePhase::CommandId &&
+      !ancs::isAttributeResponseStart(data, len, g_inFlightMeta.uid)) {
     return;
   }
   g_parser.feed(data, len, onParserComplete, nullptr);
@@ -691,6 +711,7 @@ bool IosAncsService::begin(const char*) { return false; }
 bool IosAncsService::end(uint32_t) { return true; }
 void IosAncsService::poll() {}
 IosAncsService::State IosAncsService::state() const { return State::Stopped; }
+const char* IosAncsService::lastError() const { return "Bluetooth disabled in this build"; }
 bool IosAncsService::isConnected() const { return false; }
 bool IosAncsService::isSubscribed() const { return false; }
 bool IosAncsService::consumeUiDirty() { return false; }

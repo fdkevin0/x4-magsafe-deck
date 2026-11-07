@@ -130,6 +130,64 @@ size_t parseCardsText(std::string_view content, std::array<BadgeCard, N>& outCar
   return count;
 }
 
+// Incremental cards.txt parser: feed the file in arbitrary chunks (no need to hold the whole file in
+// RAM) and stop reading once `full()`. Lines longer than kMaxLineBytes cannot be a valid card (the
+// fields are much smaller) and are skipped instead of truncated, so a QR payload is never cut silently.
+template <size_t N>
+class CardsTextStreamParser {
+ public:
+  static constexpr size_t kMaxLineBytes = 512;
+
+  CardsTextStreamParser(std::array<BadgeCard, N>& cards, size_t existingCount)
+      : cards_(cards), count_(std::min(existingCount, N)) {}
+
+  void feed(const char* data, size_t len) {
+    for (size_t i = 0; i < len && !full(); ++i) {
+      const char c = data[i];
+      if (c == '\n') {
+        flushLine();
+        continue;
+      }
+      if (overlong_) continue;
+      if (lineLen_ == kMaxLineBytes) {
+        overlong_ = true;
+        ++skippedOverlong_;
+        continue;
+      }
+      line_[lineLen_++] = c;
+    }
+  }
+
+  // Parse a trailing line without a newline. Call once after the last feed().
+  void finish() {
+    if (!full()) flushLine();
+  }
+
+  bool full() const { return count_ >= N; }
+  size_t count() const { return count_; }
+  size_t skippedOverlongLines() const { return skippedOverlong_; }
+
+ private:
+  void flushLine() {
+    if (!overlong_ && lineLen_ > 0 && count_ < N) {
+      if (parseCardLine(std::string_view(line_.data(), lineLen_), cards_[count_])) {
+        ++count_;
+      } else {
+        cards_[count_].clear();
+      }
+    }
+    lineLen_ = 0;
+    overlong_ = false;
+  }
+
+  std::array<BadgeCard, N>& cards_;
+  size_t count_;
+  std::array<char, kMaxLineBytes> line_{};
+  size_t lineLen_ = 0;
+  bool overlong_ = false;
+  size_t skippedOverlong_ = 0;
+};
+
 inline void populateDefaultCards(BadgeCard& badgeOut, BadgeCard& passOut) {
   badgeOut.clear();
   badgeOut.kind = BadgeKind::PassOrCard;

@@ -150,6 +150,25 @@ inline bool parseNotificationSourcePacket(const uint8_t* data, size_t len, Notif
   return true;
 }
 
+// Whether a Notification Source event should trigger a GetNotificationAttributes request.
+// Silent notifications (Added or Modified) are never shown, and Removed events carry no attributes.
+inline bool shouldFetchAttributes(const NotificationSourceEvent& ev) {
+  if (ev.eventId == EventId::Removed) return false;
+  return (ev.eventFlags & kEventFlagSilent) == 0;
+}
+
+// Whether a Data Source packet can be the first packet of the GetNotificationAttributes response for
+// `expectedUid`: CommandID 0 followed by the little-endian UID. A packet shorter than the 5-byte header
+// is accepted if its bytes match the header prefix. Used to drop late fragments of a timed-out
+// response instead of parsing them as the start of the next one.
+inline bool isAttributeResponseStart(const uint8_t* data, size_t len, uint32_t expectedUid) {
+  if (!data || len == 0) return false;
+  uint8_t header[5];
+  header[0] = static_cast<uint8_t>(CommandId::GetNotificationAttributes);
+  std::memcpy(header + 1, &expectedUid, sizeof(uint32_t));
+  return std::memcmp(data, header, std::min<size_t>(len, sizeof(header))) == 0;
+}
+
 // Build the 13-byte GetNotificationAttributes Control Point request for:
 // AppIdentifier (0x00), Title (0x01, maxLen), Message (0x03, maxLen), Date (0x05).
 inline constexpr size_t kGetAttributesRequestSize = 13;
