@@ -54,7 +54,7 @@ x4-magsafe-deck/
 │   │   ├── UsbSerialJtagHandoff.{h,cpp}    # ESP32-C3 USB Serial/JTAG boot handoff
 │   │   └── skip_efuse_blk_check.c          # Linker wrapper for X4 efuse block revision check
 │   └── util/
-│       ├── QrUtils.{h,cpp}                 # Auto-version, auto-mode E-Ink QR code renderer (qrcodegen)
+│       └── QrUtils.{h,cpp}                 # Auto-version, auto-mode E-Ink QR code renderer (qrcodegen)
 ├── patches/
 │   └── crosspoint-dualboot-switcher.patch  # Minimal patch adding dual-boot switching to CrossPoint Reader
 ├── scripts/

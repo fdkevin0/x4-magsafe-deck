@@ -70,6 +70,9 @@ IosAncsService::State g_ancsState = IosAncsService::State::Stopped;
 std::array<magsafe_badge::BadgeCard, kMaxBadges> g_badges{};
 SharedFontLoader g_sharedFonts{};
 
+static_assert(magsafe_badge::BadgeCard::kQrMax - 1 <= QrUtils::kMaxPayloadBytes,
+              "Badge QR payloads must fit the largest QR version QrUtils draws");
+
 bool hasExtension(const char* name, const char* ext) {
   if (!name || !ext) return false;
   const size_t nameLen = std::strlen(name);

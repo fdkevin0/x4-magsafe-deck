@@ -11,19 +11,18 @@
 #include "Memory.h"
 
 void QrUtils::drawQrCode(const GfxRenderer& renderer, const Rect& bounds, const std::string& textPayload) {
-  // Byte-mode capacity of a version 40 symbol at ECC LOW. Longer payloads are cut
-  // at a UTF-8 boundary so a multi-byte sequence is never split.
-  static constexpr size_t kMaxQrCapacity = 2953;
+  // Payloads longer than the kMaxVersion byte-mode capacity are cut at a UTF-8
+  // boundary so a multi-byte sequence is never split.
   std::string truncated;
   const char* payload = textPayload.c_str();
-  if (textPayload.length() > kMaxQrCapacity) {
-    const size_t len = utf8SafeTruncateBuffer(textPayload.c_str(), static_cast<int>(kMaxQrCapacity));
+  if (textPayload.length() > kMaxPayloadBytes) {
+    const size_t len = utf8SafeTruncateBuffer(textPayload.c_str(), static_cast<int>(kMaxPayloadBytes));
     truncated = textPayload.substr(0, len);
     payload = truncated.c_str();
   }
 
-  // qrcodegen needs two buffers of up to ~3.9 KB each; keep them off the stack.
-  static constexpr size_t kBufLen = qrcodegen_BUFFER_LEN_MAX;
+  // qrcodegen needs two work buffers sized for the largest allowed version; keep them off the stack.
+  static constexpr size_t kBufLen = qrcodegen_BUFFER_LEN_FOR_VERSION(kMaxVersion);
   auto qrcode = makeUniqueNoThrow<uint8_t[]>(kBufLen);
   auto temp = makeUniqueNoThrow<uint8_t[]>(kBufLen);
   if (!qrcode || !temp) {
@@ -33,8 +32,8 @@ void QrUtils::drawQrCode(const GfxRenderer& renderer, const Rect& bounds, const 
 
   // Picks the smallest version that fits, numeric/alphanumeric mode when the text
   // allows it, and raises ECC while the version stays the same.
-  if (!qrcodegen_encodeText(payload, temp.get(), qrcode.get(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
-                            qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, /*boostEcl=*/true)) {
+  if (!qrcodegen_encodeText(payload, temp.get(), qrcode.get(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN, kMaxVersion,
+                            qrcodegen_Mask_AUTO, /*boostEcl=*/true)) {
     LOG_ERR("QR", "Text too large for a QR code (%u bytes)", static_cast<unsigned>(std::strlen(payload)));
     return;
   }

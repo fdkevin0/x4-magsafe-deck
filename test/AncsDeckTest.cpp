@@ -364,8 +364,15 @@ TEST(QrCodegenTest, PicksSmallestVersionAndCompactMode) {
                                    qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true));
   EXPECT_GE(qrcodegen_getSize(qr.data()), 21);
 
-  // A payload above the version 40 byte-mode capacity is rejected, not truncated.
-  const std::string tooLong(2954, 'x');
-  EXPECT_FALSE(qrcodegen_encodeText(tooLong.c_str(), tmp.data(), qr.data(), qrcodegen_Ecc_LOW,
-                                    qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true));
+  // QrUtils caps the version at 10: 271 bytes of byte-mode text fit, 272 do not,
+  // and buffers sized for version 10 are enough.
+  std::vector<uint8_t> qr10(qrcodegen_BUFFER_LEN_FOR_VERSION(10));
+  std::vector<uint8_t> tmp10(qrcodegen_BUFFER_LEN_FOR_VERSION(10));
+  const std::string fits(271, 'x');
+  ASSERT_TRUE(qrcodegen_encodeText(fits.c_str(), tmp10.data(), qr10.data(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
+                                   10, qrcodegen_Mask_AUTO, true));
+  EXPECT_EQ(qrcodegen_getSize(qr10.data()), 21 + 4 * 9);
+  const std::string tooLong(272, 'x');
+  EXPECT_FALSE(qrcodegen_encodeText(tooLong.c_str(), tmp10.data(), qr10.data(), qrcodegen_Ecc_LOW,
+                                    qrcodegen_VERSION_MIN, 10, qrcodegen_Mask_AUTO, true));
 }
