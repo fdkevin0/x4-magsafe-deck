@@ -29,6 +29,7 @@
 #include "network/MagSafeBadgeStore.h"
 #include "network/OtaBootSwitch.h"
 #include "network/SharedFontLoader.h"
+#include "util/PowerPolicy.h"
 #include "util/QrUtils.h"
 #include "util/StringUtils.h"
 
@@ -63,6 +64,7 @@ size_t g_badgeCount = 0;
 bool g_forceFullRefresh = true;
 uint8_t g_partialRefreshCount = 0;
 uint32_t g_lastActivityMs = 0;
+uint32_t g_lastInteractionMs = 0;  // Drives CPU frequency scaling (see applyCpuPowerPolicy).
 
 ancs::AncsNotification g_currentNotif{};
 size_t g_notifCount = 0;
@@ -395,6 +397,20 @@ void switchBackToReaderPartition() {
   }
 }
 
+bool isBleHandshakeActive(const IosAncsService::State s) {
+  return s == IosAncsService::State::ConnectedAuthenticating || s == IosAncsService::State::DiscoveringAncs;
+}
+
+// Run at full speed right after any interaction or UI update (rendering, SD/TTF font streaming, QR
+// generation and the SPI clocks all scale with the CPU/APB clock) and while BLE pairing / ANCS
+// discovery is in progress; drop to the low-power frequency once idle for IDLE_POWER_SAVING_MS.
+void applyCpuPowerPolicy(const uint32_t nowMs) {
+  const bool lowPower =
+      power_policy::shouldUseLowPower(nowMs, g_lastInteractionMs, HalPowerManager::IDLE_POWER_SAVING_MS,
+                                      isBleHandshakeActive(IosAncsService::getInstance().state()));
+  powerManager.setPowerSaving(lowPower);
+}
+
 void syncNotificationSelection() {
   g_notifCount = IosAncsService::getInstance().notificationCount();
   if (g_selectedNotifIdx >= g_notifCount && g_notifCount > 0) {
@@ -452,8 +468,8 @@ void setup() {
   g_forceFullRefresh = true;
   renderDeckFrame();
 
-  powerManager.setPowerSaving(true);
   g_lastActivityMs = millis();
+  g_lastInteractionMs = g_lastActivityMs;
 }
 
 void loop() {
@@ -465,12 +481,17 @@ void loop() {
     g_ancsState = IosAncsService::getInstance().state();
     syncNotificationSelection();
     g_lastActivityMs = now;
+    g_lastInteractionMs = now;
     dirty = true;
   }
 
   if (gpio.wasAnyPressed() || gpio.wasAnyReleased()) {
     g_lastActivityMs = now;
+    g_lastInteractionMs = now;
   }
+
+  // Restore full speed before handling input / rendering; re-enter low power only when idle.
+  applyCpuPowerPolicy(now);
 
   if (gpio.wasPressed(HalGPIO::BTN_LEFT)) {
     g_activeTab = (g_activeTab == DeckTab::Notifications) ? DeckTab::BadgeVault : DeckTab::Notifications;

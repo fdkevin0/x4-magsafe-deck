@@ -13,6 +13,8 @@
 #include <atomic>
 #include <cstring>
 
+#include "AncsNotificationList.h"
+
 namespace {
 
 constexpr uint32_t kBurstCoalesceMs = 250;
@@ -65,8 +67,7 @@ bool g_needDiscovery = false;
 uint8_t g_discoveryRetries = 0;
 uint32_t g_nextDiscoveryAttemptMs = 0;
 
-std::array<ancs::AncsNotification, IosAncsService::kMaxNotifications> g_items{};
-size_t g_itemCount = 0;
+ancs::NotificationList<IosAncsService::kMaxNotifications> g_items{};
 
 std::array<PendingUidEntry, kPendingQueueCap> g_pendingUids{};
 size_t g_pendingHead = 0;
@@ -96,18 +97,7 @@ void markDirtyLocked(uint32_t nowMs) {
   g_lastChangeMs = nowMs;
 }
 
-void removeUidLocked(uint32_t uid) {
-  for (size_t i = 0; i < g_itemCount; ++i) {
-    if (g_items[i].valid && g_items[i].uid == uid) {
-      for (size_t j = i + 1; j < g_itemCount; ++j) {
-        g_items[j - 1] = g_items[j];
-      }
-      g_items[g_itemCount - 1].clear();
-      --g_itemCount;
-      break;
-    }
-  }
-}
+void removeUidLocked(uint32_t uid) { g_items.remove(uid); }
 
 void removePendingUidLocked(uint32_t uid) {
   size_t writeIdx = 0;
@@ -419,11 +409,30 @@ void IosAncsService::poll() {
 
   if (doDiscovery && handle != BLE_HS_CONN_HANDLE_NONE) {
     if (discoverAndSubscribeAncs(handle)) {
-      g_state.store(State::SubscribedReady);
-      ScopedLock lock;
-      g_discoveryRetries = 0;
-      markDirtyLocked(millis());
-      LOG_INF("ANCS", "Subscribed to iOS ANCS");
+      bool stillConnected = false;
+      {
+        ScopedLock lock;
+        // The peer may have disconnected while the blocking GATT discovery ran on this thread; in that
+        // case onPeerDisconnect() already moved the state to Advertising and must not be overwritten.
+        stillConnected = (g_connHandle == handle);
+        if (stillConnected) {
+          g_discoveryRetries = 0;
+          // ANCS UIDs from a previous connection are stale: notifications removed on the phone while we
+          // were disconnected never produce a Removed event. iOS re-announces every live notification
+          // with the PreExisting flag right after subscription, so rebuild the list from scratch.
+          g_items.clear();
+          // Publish the new state while still holding the lock so a concurrent onPeerDisconnect()
+          // (which also takes the lock before storing Advertising) is always ordered after it.
+          g_state.store(State::SubscribedReady);
+          markDirtyLocked(millis());
+        }
+      }
+      if (stillConnected) {
+        LOG_INF("ANCS", "Subscribed to iOS ANCS");
+      } else {
+        LOG_INF("ANCS", "Peer disconnected during ANCS discovery; discarding subscription");
+        cleanupClientOnOwnerThread();
+      }
     } else {
       bool shouldDisconnect = false;
       {
@@ -518,10 +527,10 @@ bool IosAncsService::consumeUiDirty() {
 bool IosAncsService::getNotification(size_t index, ancs::AncsNotification& out, size_t& outTotal) const {
   bool ok = false;
   ScopedLock lock;
-  outTotal = g_itemCount;
-  if (g_itemCount > 0) {
-    const size_t clamped = std::min(index, g_itemCount - 1);
-    out = g_items[clamped];
+  outTotal = g_items.size();
+  if (g_items.size() > 0) {
+    const size_t clamped = std::min(index, g_items.size() - 1);
+    out = g_items.at(clamped);
     ok = true;
   } else {
     out.clear();
@@ -531,7 +540,7 @@ bool IosAncsService::getNotification(size_t index, ancs::AncsNotification& out, 
 
 size_t IosAncsService::notificationCount() const {
   ScopedLock lock;
-  return g_itemCount;
+  return g_items.size();
 }
 
 bool IosAncsService::performAction(uint32_t uid, ancs::ActionId action) {
@@ -582,6 +591,9 @@ void IosAncsService::onPeerAuthComplete(uint16_t connHandle, bool encrypted) {
 void IosAncsService::onPeerDisconnect() {
   {
     ScopedLock lock;
+    if (g_running.load()) {
+      g_state.store(State::Advertising);
+    }
     g_connHandle = BLE_HS_CONN_HANDLE_NONE;
     g_peerCleanupNeeded = true;
     g_needDiscovery = false;
@@ -595,10 +607,6 @@ void IosAncsService::onPeerDisconnect() {
     g_actionTail = 0;
     g_parser.reset();
     markDirtyLocked(millis());
-  }
-
-  if (g_running.load()) {
-    g_state.store(State::Advertising);
   }
 }
 
@@ -646,15 +654,10 @@ void IosAncsService::onAttributeComplete(const ancs::AncsNotification& parsed) {
     return;
   }
 
-  removeUidLocked(parsed.uid);
-  const size_t shiftCount = std::min<size_t>(g_itemCount, kMaxNotifications - 1);
-  for (size_t i = shiftCount; i > 0; --i) {
-    g_items[i] = g_items[i - 1];
-  }
-  g_items[0] = parsed;
-  g_items[0].categoryId = metaCategory;
-  g_items[0].eventFlags = metaFlags;
-  g_itemCount = shiftCount + 1;
+  ancs::AncsNotification item = parsed;
+  item.categoryId = metaCategory;
+  item.eventFlags = metaFlags;
+  g_items.upsertFront(item);
   markDirtyLocked(millis());
 }
 
