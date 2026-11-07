@@ -16,6 +16,7 @@ By leveraging the X4's 16 MB dual-OTA partition table (`app0` @ `0x010000` + `ap
    - Runs `NimBLE-Arduino@2.5.1` in simultaneous **BLE Peripheral + GATT Client** mode.
    - Advertises 128-bit **ANCS Service Solicitation** (`7905F431-B5CE-4E99-A40F-4B1E122D00D0`) as **`X4-MagSafe`** with iOS LE Secure Connections + IRK bonding so iOS pairs natively from **Settings → Bluetooth → X4-MagSafe**.
    - Streams live notifications into a fixed-capacity ring buffer with burst coalescing (`250 ms` quiet window, `1200 ms` max burst delay) and anti-ghosting E-Ink refresh (`FAST_REFRESH` for normal updates, periodic `HALF_REFRESH` every 15 partial refreshes).
+   - Shows each app's own name in the notification header, requested once per app via ANCS `GetAppAttributes(DisplayName)` and cached. iOS localizes this name (e.g. `微信` on a Chinese-locale iPhone), so non-Latin app names need a CJK fallback font on the SD card (see Shared Font Library below), the same as notification titles and messages.
    - **Positive / Negative Action Dispatch**: Press **`Confirm`** to dismiss a notification (`ActionId::Negative`), or press **`Power`** when `kEventFlagPositiveAction` is set to trigger the notification's positive action (`ActionId::Positive`).
 
 3. **MagSafe Zero-Power Badge / Boarding Pass / Card Vault**
