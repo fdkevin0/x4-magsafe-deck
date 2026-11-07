@@ -409,6 +409,15 @@ void applyCpuPowerPolicy(const uint32_t nowMs) {
   powerManager.setPowerSaving(lowPower);
 }
 
+// Actions are rejected while ANCS is not subscribed (the shown UIDs belong to a previous session).
+// Flash a short hint so the button press is not silently ignored; returns true so the caller redraws
+// the frame underneath the popup.
+bool showNotConnectedHint() {
+  drawPopupMessage("iPhone not connected");
+  delay(600);
+  return true;
+}
+
 void syncNotificationSelection() {
   g_notifCount = IosAncsService::getInstance().notificationCount();
   if (g_selectedNotifIdx >= g_notifCount && g_notifCount > 0) {
@@ -516,9 +525,12 @@ void loop() {
   if (gpio.wasReleased(HalGPIO::BTN_CONFIRM)) {
     if (g_activeTab == DeckTab::Notifications) {
       if (g_selectedNotifIdx < g_notifCount && g_currentNotif.valid) {
-        IosAncsService::getInstance().dismissNotification(g_currentNotif.uid);
-        syncNotificationSelection();
-        dirty = true;
+        if (IosAncsService::getInstance().dismissNotification(g_currentNotif.uid)) {
+          syncNotificationSelection();
+          dirty = true;
+        } else {
+          dirty |= showNotConnectedHint();
+        }
       }
     } else {
       lockPassAndDeepSleep();
@@ -529,9 +541,12 @@ void loop() {
   if (gpio.wasReleased(HalGPIO::BTN_POWER) && g_activeTab == DeckTab::Notifications) {
     if (g_selectedNotifIdx < g_notifCount && g_currentNotif.valid &&
         (g_currentNotif.eventFlags & ancs::kEventFlagPositiveAction) != 0) {
-      IosAncsService::getInstance().performAction(g_currentNotif.uid, ancs::ActionId::Positive);
-      syncNotificationSelection();
-      dirty = true;
+      if (IosAncsService::getInstance().performAction(g_currentNotif.uid, ancs::ActionId::Positive)) {
+        syncNotificationSelection();
+        dirty = true;
+      } else {
+        dirty |= showNotConnectedHint();
+      }
     }
   }
 
