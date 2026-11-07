@@ -16,16 +16,21 @@ By leveraging the X4's 16 MB dual-OTA partition table (`app0` @ `0x010000` + `ap
    - Runs `NimBLE-Arduino@2.5.1` in simultaneous **BLE Peripheral + GATT Client** mode.
    - Advertises 128-bit **ANCS Service Solicitation** (`7905F431-B5CE-4E99-A40F-4B1E122D00D0`) as **`X4-MagSafe`** with iOS LE Secure Connections + IRK bonding so iOS pairs natively from **Settings → Bluetooth → X4-MagSafe**.
    - Streams live notifications into a fixed-capacity ring buffer with burst coalescing (`250 ms` quiet window, `1200 ms` max burst delay) and anti-ghosting E-Ink refresh (`FAST_REFRESH` for normal updates, periodic `HALF_REFRESH` every 15 partial refreshes).
+   - Shows each app's own name in the notification header, requested once per app via ANCS `GetAppAttributes(DisplayName)` and cached. iOS localizes this name (e.g. `微信` on a Chinese-locale iPhone), so non-Latin app names need a CJK fallback font on the SD card (see Shared Font Library below), the same as notification titles and messages.
    - **Positive / Negative Action Dispatch**: Press **`Confirm`** to dismiss a notification (`ActionId::Negative`), or press **`Power`** when `kEventFlagPositiveAction` is set to trigger the notification's positive action (`ActionId::Positive`).
 
 3. **MagSafe Zero-Power Badge / Boarding Pass / Card Vault**
    - Loads `/badges/cards.txt`, `/badges/*.json`, or `/badges/*.bmp` from the MicroSD card (skipping hidden `.*` / macOS `._*` files and falling back to built-in default passes when no SD card is inserted).
-   - Renders high-contrast QR codes (`ricmoo/QRCode`, auto-selecting Byte-mode QR versions 4–40) + pass metadata (`Tag`, `Title`, `Subtitle`, `Meta`).
-   - **Zero-Power Lock (`Lock Pass & Sleep`)**: Press **`Confirm`** on the Badge Vault tab (or after 20 minutes of inactivity) to perform a clean `FULL_REFRESH` and immediately enter ESP32-C3 deep sleep while retaining the E-Ink image at **0 W** power consumption—keeping boarding passes, train tickets, and contact QR badges scannable even if the battery is completely depleted.
+   - Renders high-contrast QR codes (vendored `nayuki/QR-Code-generator`, auto-selecting the smallest QR version and numeric / alphanumeric / byte mode) + pass metadata (`Tag`, `Title`, `Subtitle`, `Meta`).
+   - **Zero-Power Lock (`Lock Pass & Sleep`)**: Press **`Confirm`** on the Badge Vault tab, hold **`Power`** for 1.5 s on any tab (release when prompted), or leave the deck without a button press for 20 minutes to perform a clean `FULL_REFRESH` and immediately enter ESP32-C3 deep sleep while retaining the E-Ink image at **0 W** power consumption—keeping boarding passes, train tickets, and contact QR badges scannable even if the battery is completely depleted.
 
 4. **Shared CJK / Non-Latin Font Library with CrossPoint Reader**
    - Automatically discovers and shares the MicroSD font directories (`/.fonts` and `/fonts`) and user font selection (`/.crosspoint/settings.json` → `"sdFontFamilyName"`) with **CrossPoint Reader** (`app0`).
    - Supports both pre-rasterized **`.cpfont`** families (`SdCardFont`) and streamed **`.ttf` / `.otf` / `.ttc`** vector fonts (`TtfEpdFont`), registering size-matched CJK fallbacks for `UI_10_FONT_ID` and `UI_12_FONT_ID` so Chinese/Japanese/Korean iOS notifications and MagSafe badges render natively without duplicating font files on the SD card.
+
+5. **Power Button Behavior**
+   - Cold boot from the power button requires a ~0.5 s hold; shorter presses (a bump in a pocket, or the phone pressing on the MagSafe side) power straight back off. Plugging in USB while off only charges.
+   - A short press (under 0.6 s) of **`Power`** on the Notifications tab triggers the positive action (when available); a 1.5 s hold locks the current pass on screen and powers off.
 
 ---
 
@@ -54,8 +59,7 @@ x4-magsafe-deck/
 │   │   ├── UsbSerialJtagHandoff.{h,cpp}    # ESP32-C3 USB Serial/JTAG boot handoff
 │   │   └── skip_efuse_blk_check.c          # Linker wrapper for X4 efuse block revision check
 │   └── util/
-│       ├── QrUtils.{h,cpp}                 # Byte-mode auto-version E-Ink QR code renderer
-│       └── StringUtils.h                   # Case-insensitive ASCII comparison helper
+│       └── QrUtils.{h,cpp}                 # Auto-version, auto-mode E-Ink QR code renderer (qrcodegen)
 ├── patches/
 │   └── crosspoint-dualboot-switcher.patch  # Minimal patch adding dual-boot switching to CrossPoint Reader
 ├── scripts/
@@ -79,8 +83,9 @@ x4-magsafe-deck/
 
 ### 1. Build Standalone `x4-magsafe-deck` (`app1`)
 
-Requires PlatformIO Core 6.2.0 or newer (pioarduino 55.03.312+ refuses older
-cores). Run `git submodule update --init --recursive` first.
+Run `git submodule update --init --recursive` first. The pioarduino platform is
+pinned to the same release as CrossPoint Reader (currently 55.03.311, which needs
+PlatformIO Core 6.1.19) so both apps share one framework build cache.
 
 ```bash
 export PATH="$HOME/.platformio/penv/bin:$PATH"
@@ -153,6 +158,8 @@ DIGITAL CARD|XTEINK X4 MAGSAFE DECK|BLE ANCS + ZERO-POWER VAULT|https://crosspoi
 EMERGENCY ICE|IF FOUND PLEASE CONTACT|REWARD IF RETURNED|tel:+8613800000000
 Quick WiFi|WIFI:S:Guest;T:WPA;P:secret;;
 ```
+
+`cards.txt` can be any size (comments with `#` are fine); it is streamed line by line and reading stops after 8 cards. Lines longer than 512 bytes are skipped; within a line each field is clipped to its limit (QR payload: 255 bytes).
 
 Or place individual `/badges/*.json` files (`{"tag":"...","title":"...","subtitle":"...","meta":"...","qr":"..."}`; `"detail"` is also accepted as an alias for `"meta"`) or `/badges/*.bmp` BMP images.
 

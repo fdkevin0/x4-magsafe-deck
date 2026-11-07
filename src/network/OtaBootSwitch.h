@@ -5,6 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "OtaSeq.h"
+
 // X4 (and X3) factory bootloaders accept our patch_firmware_image.py-patched
 // firmware.bin (web flasher proves this), but the running ESP-IDF's
 // esp_image_verify rejects with bogus efuse-blk-rev errors. Both SD-card and

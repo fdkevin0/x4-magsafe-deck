@@ -26,6 +26,8 @@ class IosAncsService {
   void poll();
 
   State state() const;
+  // Human-readable reason for the last begin() failure ("" when it succeeded or never ran).
+  const char* lastError() const;
   bool isConnected() const;
   bool isSubscribed() const;
 

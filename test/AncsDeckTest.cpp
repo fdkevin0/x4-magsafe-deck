@@ -9,11 +9,14 @@
 #include "Utf8.h"
 #include "network/AncsNotificationList.h"
 #include "network/AncsProtocol.h"
+#include "network/AppleBleParams.h"
 #include "network/FirmwareBoardTag.h"
 #include "network/FirmwareImageVerify.h"
 #include "network/MagSafeBadgeStore.h"
+#include "network/OtaSeq.h"
 #include "util/PowerPolicy.h"
-#include "util/StringUtils.h"
+#include "util/QrLayout.h"
+#include "qrcodegen.h"
 
 namespace {
 
@@ -238,7 +241,7 @@ TEST(AncsProtocolTest, HandlesZeroLengthAttributesCleanly) {
 
   ASSERT_TRUE(completed.valid);
   EXPECT_EQ(completed.uid, 7U);
-  EXPECT_STREQ(ancs::friendlyAppName(completed.appId), "Messages");
+  EXPECT_STREQ(ancs::displayAppName(completed), "Messages");
   EXPECT_STREQ(completed.title, "");
   EXPECT_STREQ(completed.message, "Verification code: 849201");
 }
@@ -350,11 +353,34 @@ TEST(FirmwareImageVerifyTest, ValidatesHeaderChecksumSha256AndBoardTag) {
             firmware_flash::Result::BAD_SEGMENTS);
 }
 
-TEST(StringUtilsTest, AsciiCaseCmpComparesCaseInsensitively) {
-  EXPECT_EQ(StringUtils::asciiCaseCmp(".BMP", ".bmp"), 0);
-  EXPECT_EQ(StringUtils::asciiCaseCmp(".Json", ".JSON"), 0);
-  EXPECT_LT(StringUtils::asciiCaseCmp("abc", "abd"), 0);
-  EXPECT_GT(StringUtils::asciiCaseCmp("abd", "ABC"), 0);
+TEST(QrCodegenTest, PicksSmallestVersionAndCompactMode) {
+  std::vector<uint8_t> qr(qrcodegen_BUFFER_LEN_MAX);
+  std::vector<uint8_t> tmp(qrcodegen_BUFFER_LEN_MAX);
+
+  // A 60-character uppercase IATA BCBP boarding pass string fits alphanumeric mode.
+  // Byte mode at ECC LOW needs version 4 (78 B); alphanumeric fits in version 3.
+  const char* bcbp = "M1DESMARAIS/LUC       EABC123 YULFRAAC 0834 326J001A0025 100";
+  ASSERT_TRUE(qrcodegen_encodeText(bcbp, tmp.data(), qr.data(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
+                                   qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true));
+  EXPECT_LE(qrcodegen_getSize(qr.data()), 21 + 4 * 2);  // version <= 3
+
+  // Mixed-case UTF-8 text falls back to byte mode and still encodes.
+  const char* cjk = "WIFI:S:\xE5\x92\x96\xE5\x95\xA1;T:WPA;P:secret;;";
+  ASSERT_TRUE(qrcodegen_encodeText(cjk, tmp.data(), qr.data(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
+                                   qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true));
+  EXPECT_GE(qrcodegen_getSize(qr.data()), 21);
+
+  // QrUtils caps the version at 10: 271 bytes of byte-mode text fit, 272 do not,
+  // and buffers sized for version 10 are enough.
+  std::vector<uint8_t> qr10(qrcodegen_BUFFER_LEN_FOR_VERSION(10));
+  std::vector<uint8_t> tmp10(qrcodegen_BUFFER_LEN_FOR_VERSION(10));
+  const std::string fits(271, 'x');
+  ASSERT_TRUE(qrcodegen_encodeText(fits.c_str(), tmp10.data(), qr10.data(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
+                                   10, qrcodegen_Mask_AUTO, true));
+  EXPECT_EQ(qrcodegen_getSize(qr10.data()), 21 + 4 * 9);
+  const std::string tooLong(272, 'x');
+  EXPECT_FALSE(qrcodegen_encodeText(tooLong.c_str(), tmp10.data(), qr10.data(), qrcodegen_Ecc_LOW,
+                                    qrcodegen_VERSION_MIN, 10, qrcodegen_Mask_AUTO, true));
 }
 
 namespace {
@@ -422,4 +448,290 @@ TEST(PowerPolicyTest, LowPowerOnlyWhenIdleAndNoBleHandshake) {
   // millis() wrap-around: 200 ms after an interaction just before overflow is not idle.
   EXPECT_FALSE(power_policy::shouldUseLowPower(100, 0xFFFFFF9Cu, kIdle, false));
   EXPECT_TRUE(power_policy::shouldUseLowPower(5000, 0xFFFFFF9Cu, kIdle, false));
+}
+
+TEST(AncsProtocolTest, SkipsSilentAddedAndModifiedEvents) {
+  ancs::NotificationSourceEvent ev{};
+  ev.eventId = ancs::EventId::Added;
+  ev.eventFlags = 0;
+  EXPECT_TRUE(ancs::shouldFetchAttributes(ev));
+  ev.eventFlags = ancs::kEventFlagSilent;
+  EXPECT_FALSE(ancs::shouldFetchAttributes(ev));
+  ev.eventId = ancs::EventId::Modified;
+  EXPECT_FALSE(ancs::shouldFetchAttributes(ev));
+  ev.eventFlags = ancs::kEventFlagImportant;
+  EXPECT_TRUE(ancs::shouldFetchAttributes(ev));
+  ev.eventId = ancs::EventId::Removed;
+  EXPECT_FALSE(ancs::shouldFetchAttributes(ev));
+}
+
+TEST(AncsProtocolTest, DropsLateFragmentOfTimedOutResponse) {
+  const uint32_t oldUid = 0x11223344u;
+  const uint32_t newUid = 0x55667788u;
+
+  // Full response for the new request.
+  std::vector<uint8_t> resp = {0x00};
+  for (int i = 0; i < 4; ++i) resp.push_back(static_cast<uint8_t>((newUid >> (8 * i)) & 0xFF));
+  appendAttr(resp, ancs::AttributeId::AppIdentifier, "com.apple.MobileSMS");
+  appendAttr(resp, ancs::AttributeId::Title, "Alice");
+  appendAttr(resp, ancs::AttributeId::Message, "hello");
+  appendAttr(resp, ancs::AttributeId::Date, "20261107T101500");
+
+  // A late continuation of the old response whose first byte happens to be 0x00.
+  const std::vector<uint8_t> lateFragment = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 'x', 'y'};
+  EXPECT_FALSE(ancs::isAttributeResponseStart(lateFragment.data(), lateFragment.size(), newUid));
+  EXPECT_TRUE(ancs::isAttributeResponseStart(resp.data(), resp.size(), newUid));
+  EXPECT_FALSE(ancs::isAttributeResponseStart(resp.data(), resp.size(), oldUid));
+  // A header split across packets is accepted by prefix.
+  EXPECT_TRUE(ancs::isAttributeResponseStart(resp.data(), 3, newUid));
+  EXPECT_FALSE(ancs::isAttributeResponseStart(nullptr, 0, newUid));
+
+  // Gate exactly like IosAncsService::onDataSourceBytes and check the real response still parses.
+  ancs::AncsDataSourceParser parser;
+  int completed = 0;
+  ancs::AncsNotification got{};
+  std::pair<int*, ancs::AncsNotification*> ctxPair{&completed, &got};
+  auto feedGated = [&](const std::vector<uint8_t>& pkt) {
+    if (parser.phase() == ancs::AncsDataSourceParser::ParsePhase::CommandId &&
+        !ancs::isAttributeResponseStart(pkt.data(), pkt.size(), newUid)) {
+      return;
+    }
+    parser.feed(
+        pkt.data(), pkt.size(),
+        [](const ancs::AncsNotification& item, void* ctx) {
+          auto* pair = static_cast<std::pair<int*, ancs::AncsNotification*>*>(ctx);
+          ++*pair->first;
+          *pair->second = item;
+        },
+        &ctxPair);
+  };
+  feedGated(lateFragment);
+  feedGated(resp);
+  EXPECT_EQ(completed, 1);
+  EXPECT_EQ(got.uid, newUid);
+  EXPECT_STREQ(got.title, "Alice");
+  EXPECT_STREQ(got.message, "hello");
+}
+
+TEST(MagSafeBadgeStoreTest, StreamParserHandlesChunksLargeFilesAndOverlongLines) {
+  std::string text = "# comment line\r\n";
+  text += std::string(3000, '#') + "\n";                     // >2 KB of comments must not reject the file
+  text += "A|" + std::string(600, 'x') + "\n";               // overlong line is skipped, not truncated
+  for (int i = 0; i < 10; ++i) {
+    text += "TAG|Title " + std::to_string(i) + "|payload-" + std::to_string(i) + "\r\n";
+  }
+
+  std::array<magsafe_badge::BadgeCard, 8> cards{};
+  magsafe_badge::CardsTextStreamParser<8> parser(cards, 0);
+  // Feed in awkward 7-byte chunks so lines straddle chunk boundaries.
+  size_t fed = 0;
+  for (size_t pos = 0; pos < text.size() && !parser.full(); pos += 7) {
+    const size_t n = std::min<size_t>(7, text.size() - pos);
+    parser.feed(text.data() + pos, n);
+    fed = pos + n;
+  }
+  parser.finish();
+
+  EXPECT_TRUE(parser.full());
+  EXPECT_LT(fed, text.size());  // stopped reading once 8 cards were parsed
+  ASSERT_EQ(parser.count(), 8u);
+  EXPECT_EQ(parser.skippedOverlongLines(), 2u);  // the 3000-byte comment and the 600-byte card
+  EXPECT_STREQ(cards[0].title, "Title 0");
+  EXPECT_STREQ(cards[0].qrPayload, "payload-0");
+  EXPECT_STREQ(cards[7].title, "Title 7");
+}
+
+TEST(MagSafeBadgeStoreTest, StreamParserParsesTrailingLineWithoutNewlineAndKeepsExisting) {
+  std::array<magsafe_badge::BadgeCard, 4> cards{};
+  magsafe_badge::copyTrimmedField(cards[0].title, sizeof(cards[0].title), "existing");
+  magsafe_badge::CardsTextStreamParser<4> parser(cards, 1);
+  const std::string text = "Only|tel:+100";
+  parser.feed(text.data(), text.size());
+  EXPECT_EQ(parser.count(), 1u);
+  parser.finish();
+  ASSERT_EQ(parser.count(), 2u);
+  EXPECT_STREQ(cards[0].title, "existing");
+  EXPECT_STREQ(cards[1].title, "Only");
+  EXPECT_STREQ(cards[1].qrPayload, "tel:+100");
+}
+
+TEST(QrLayoutTest, ReservesFourModuleQuietZone) {
+  // 57-module (version 10) symbol in a 400x400 box: 65 modules incl. quiet zone -> 6 px modules.
+  const auto l = qr_layout::fit(57, 40, 100, 400, 400);
+  EXPECT_EQ(l.modulePx, 6);
+  EXPECT_EQ(l.outerSide, 65 * 6);
+  EXPECT_EQ(l.originX - l.outerX, 4 * 6);
+  EXPECT_EQ(l.originY - l.outerY, 4 * 6);
+  // Symbol + quiet zone stays inside the box and is centered.
+  EXPECT_GE(l.outerX, 40);
+  EXPECT_LE(l.outerX + l.outerSide, 440);
+  EXPECT_EQ(l.outerX - 40, 440 - (l.outerX + l.outerSide));
+
+  // Too small to fit even 1 px modules plus quiet zone.
+  EXPECT_EQ(qr_layout::fit(57, 0, 0, 60, 60).modulePx, 0);
+  EXPECT_EQ(qr_layout::fit(0, 0, 0, 100, 100).modulePx, 0);
+}
+
+TEST(AppleBleParamsTest, ValidatesQa1931ConnectionRules) {
+  // Shipped parameters: 30-60 ms, latency 4, 4 s.
+  EXPECT_TRUE(apple_ble::connParamsValid(24, 48, 4, 400));
+  // Apple's max-latency option is also legal: 60 ms * 31 = 1.86 s <= 2 s, x3 = 5.58 s < 6 s.
+  EXPECT_TRUE(apple_ble::connParamsValid(24, 48, 30, 600));
+  EXPECT_TRUE(apple_ble::connParamsValid(12, 12, 0, 200));    // Min == Max == 15 ms is allowed
+  EXPECT_FALSE(apple_ble::connParamsValid(16, 48, 4, 400));   // 20 ms min is not a multiple of 15 ms
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 30, 4, 400));   // Min + 15 ms > Max
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 48, 31, 600));  // latency > 30
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 48, 30, 400));  // 1.86 s * 3 >= 4 s timeout
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 48, 4, 700));   // timeout > 6 s
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 48, 0, 150));   // timeout < 2 s
+}
+
+TEST(AppleBleParamsTest, AdvertisingIntervalsMatchAppleList) {
+  EXPECT_EQ(apple_ble::kFastAdvIntervalUnits * 625, 20000);  // 20 ms in microseconds
+  bool found = false;
+  for (const auto units : apple_ble::kAppleSlowAdvIntervalsUnits) {
+    found |= (units == apple_ble::kSlowAdvIntervalUnits);
+  }
+  EXPECT_TRUE(found);
+  EXPECT_EQ(apple_ble::kSlowAdvIntervalUnits * 625, 1022500);  // 1022.5 ms exactly
+  // Every listed Apple interval converts exactly to 0.625 ms units.
+  const uint32_t appleUs[] = {152500, 211250, 318750, 417500, 546250, 760000, 852500, 1022500, 1285000};
+  for (size_t i = 0; i < 9; ++i) {
+    EXPECT_EQ(apple_ble::kAppleSlowAdvIntervalsUnits[i] * 625u, appleUs[i]);
+  }
+}
+
+TEST(OtaSeqTest, PicksSlotAndWrapsAboveOtherSlot) {
+  // (seq - 1) % 2 selects the OTA slot, and the new seq must beat the active one.
+  auto p = ota_boot::planNextSeq(5, 1);  // active seq 5 -> ota_0; switch to ota_1
+  EXPECT_EQ(p.seq, 6u);
+  EXPECT_FALSE(p.wrapped);
+  p = ota_boot::planNextSeq(5, 0);
+  EXPECT_EQ(p.seq, 7u);
+  EXPECT_EQ((p.seq - 1) % 2, 0u);
+  p = ota_boot::planNextSeq(0, 0);  // fresh otadata
+  EXPECT_EQ(p.seq, 1u);
+
+  // Near UINT32_MAX the seq wraps; the caller must then erase the other sector (wrapped == true),
+  // because a small seq alone would lose to the old entry.
+  p = ota_boot::planNextSeq(0xFFFFFFFCu, 1);
+  EXPECT_TRUE(p.wrapped);
+  EXPECT_EQ(p.seq, 2u);
+  EXPECT_LT(p.seq, 0xFFFFFFFCu);
+  p = ota_boot::planNextSeq(0xFFFFFFFBu, 0);
+  EXPECT_FALSE(p.wrapped);
+  EXPECT_EQ(p.seq, 0xFFFFFFFDu);  // never 0xFFFFFFFF (erased flash)
+  EXPECT_EQ((p.seq - 1) % 2, 0u);
+}
+
+TEST(AncsAppAttributesTest, BuildsRequestAndParsesFragmentedDisplayName) {
+  uint8_t pkt[ancs::kGetAppAttributesRequestMax] = {};
+  const size_t len = ancs::buildGetAppAttributesPacket("com.tencent.xin", pkt);
+  ASSERT_EQ(len, 1U + 15U + 1U + 1U);
+  EXPECT_EQ(pkt[0], static_cast<uint8_t>(ancs::CommandId::GetAppAttributes));
+  EXPECT_EQ(std::memcmp(pkt + 1, "com.tencent.xin", 16), 0);  // includes NUL
+  EXPECT_EQ(pkt[17], static_cast<uint8_t>(ancs::AppAttributeId::DisplayName));
+  EXPECT_EQ(ancs::buildGetAppAttributesPacket("", pkt), 0U);
+  const std::string tooLong(ancs::AncsNotification::kAppIdMax, 'a');
+  EXPECT_EQ(ancs::buildGetAppAttributesPacket(tooLong.c_str(), pkt), 0U);
+
+  // Response: 0x01 "com.tencent.xin\0" 0x00 len16 "微信", split at awkward boundaries.
+  std::vector<uint8_t> resp = {0x01};
+  const std::string appId = "com.tencent.xin";
+  resp.insert(resp.end(), appId.begin(), appId.end());
+  resp.push_back(0x00);
+  const std::string name = "\xE5\xBE\xAE\xE4\xBF\xA1";
+  resp.push_back(0x00);
+  resp.push_back(static_cast<uint8_t>(name.size()));
+  resp.push_back(0x00);
+  resp.insert(resp.end(), name.begin(), name.end());
+
+  EXPECT_TRUE(ancs::isAppAttributeResponseStart(resp.data(), 5, "com.tencent.xin"));
+  EXPECT_TRUE(ancs::isAppAttributeResponseStart(resp.data(), resp.size(), "com.tencent.xin"));
+  EXPECT_FALSE(ancs::isAppAttributeResponseStart(resp.data(), resp.size(), "com.tencent.xinx"));
+  EXPECT_FALSE(ancs::isAppAttributeResponseStart(resp.data(), resp.size(), "com.tencent"));
+
+  struct Result {
+    std::string appId;
+    std::string name;
+    int calls = 0;
+  } result;
+  auto cb = [](const char* id, const char* n, void* ctx) {
+    auto* r = static_cast<Result*>(ctx);
+    r->appId = id;
+    r->name = n;
+    ++r->calls;
+  };
+  ancs::AncsAppAttributeParser parser;
+  parser.reset();
+  const size_t cuts[] = {1, 7, 17, 18, 20, resp.size()};
+  size_t pos = 0;
+  for (size_t cut : cuts) {
+    parser.feed(resp.data() + pos, cut - pos, cb, &result);
+    pos = cut;
+  }
+  EXPECT_EQ(result.calls, 1);
+  EXPECT_EQ(result.appId, "com.tencent.xin");
+  EXPECT_EQ(result.name, name);
+  EXPECT_TRUE(parser.atStart());
+
+  // Wrong command id is rejected without a callback.
+  const uint8_t bad[] = {0x00, 'x', 0x00, 0x00, 0x00, 0x00};
+  parser.feed(bad, sizeof(bad), cb, &result);
+  EXPECT_EQ(result.calls, 1);
+}
+
+TEST(AncsAppAttributesTest, CacheAndDisplayNameFallback) {
+  ancs::AppNameCache<2> cache;
+  EXPECT_EQ(cache.find("com.a"), nullptr);
+  cache.put("com.a", "Alpha");
+  cache.put("com.b", "");  // iOS reported no name: cached as known-empty
+  ASSERT_NE(cache.find("com.a"), nullptr);
+  EXPECT_STREQ(cache.find("com.a"), "Alpha");
+  ASSERT_NE(cache.find("com.b"), nullptr);
+  EXPECT_STREQ(cache.find("com.b"), "");
+  cache.put("com.c", "Gamma");  // evicts the oldest entry
+  EXPECT_EQ(cache.find("com.a"), nullptr);
+  EXPECT_STREQ(cache.find("com.c"), "Gamma");
+  cache.put("com.c", "Gamma2");
+  EXPECT_STREQ(cache.find("com.c"), "Gamma2");
+  EXPECT_EQ(cache.size(), 2U);
+
+  // Provisional (timeout) entries are dropped on clearProvisional; iOS answers survive.
+  ancs::AppNameCache<3> conn;
+  conn.put("com.ok", "Ok");
+  conn.put("com.timeout", "", /*provisional=*/true);
+  conn.put("com.empty", "");
+  conn.clearProvisional();
+  EXPECT_EQ(conn.size(), 2U);
+  EXPECT_EQ(conn.find("com.timeout"), nullptr);
+  EXPECT_STREQ(conn.find("com.ok"), "Ok");
+  EXPECT_STREQ(conn.find("com.empty"), "");
+  conn.put("com.timeout", "Later");  // a later real answer replaces nothing stale
+  EXPECT_STREQ(conn.find("com.timeout"), "Later");
+
+  ancs::AncsNotification item{};
+  EXPECT_STREQ(ancs::displayAppName(item), "iOS");
+  std::strcpy(item.appId, "com.tencent.xin");
+  EXPECT_STREQ(ancs::displayAppName(item), "WeChat");  // friendlyAppName fallback
+  std::strcpy(item.appId, "com.example.notes");
+  EXPECT_STREQ(ancs::displayAppName(item), "notes");
+  std::strcpy(item.appId, "com.apple.MobileSMS");
+  std::strcpy(item.appName, "Messages");
+  EXPECT_STREQ(ancs::displayAppName(item), "Messages");
+
+  ancs::NotificationList<4> list;
+  ancs::AncsNotification a{};
+  a.uid = 1;
+  a.valid = true;
+  std::strcpy(a.appId, "com.x");
+  ancs::AncsNotification b = a;
+  b.uid = 2;
+  std::strcpy(b.appId, "com.y");
+  list.upsertFront(a);
+  list.upsertFront(b);
+  EXPECT_TRUE(list.setAppName("com.x", "Ex"));
+  EXPECT_FALSE(list.setAppName("com.x", "Ex"));
+  EXPECT_STREQ(list.at(1).appName, "Ex");
+  EXPECT_STREQ(list.at(0).appName, "");
 }
