@@ -83,6 +83,10 @@ x4-magsafe-deck/
 
 ### 1. Build Standalone `x4-magsafe-deck` (`app1`)
 
+Run `git submodule update --init --recursive` first. The pioarduino platform is
+pinned to the same release as CrossPoint Reader (currently 55.03.311, which needs
+PlatformIO Core 6.1.19) so both apps share one framework build cache.
+
 ```bash
 export PATH="$HOME/.platformio/penv/bin:$PATH"
 pio run -e x4_deck
