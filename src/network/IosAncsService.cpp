@@ -103,7 +103,8 @@ uint32_t g_requestSentAtMs = 0;
 
 ancs::AncsDataSourceParser g_parser{};
 ancs::AncsAppAttributeParser g_appParser{};
-// Kept across reconnects: an app's display name does not change between sessions.
+// Answers from iOS are kept across reconnects (an app's display name does not change between
+// sessions); timeout entries are provisional and dropped on disconnect.
 ancs::AppNameCache<kAppNameCacheCap> g_appNames{};
 
 bool g_uiDirty = false;
@@ -592,8 +593,9 @@ void IosAncsService::poll() {
     if (g_connHandle == BLE_HS_CONN_HANDLE_NONE) return;
     if (g_requestInFlight && (now - g_requestSentAtMs) > kAttrRequestTimeoutMs) {
       if (g_inFlightKind == RequestKind::App) {
-        // Remember the miss so this app is not asked about on every notification.
-        g_appNames.put(g_inFlightAppId.data(), "");
+        // Remember the miss for this connection so the app is not asked about on every
+        // notification; it is asked again after a reconnect.
+        g_appNames.put(g_inFlightAppId.data(), "", /*provisional=*/true);
       }
       g_requestInFlight = false;
       g_parser.reset();
@@ -751,6 +753,7 @@ void IosAncsService::onPeerDisconnect() {
     g_actionTail = 0;
     g_parser.reset();
     g_appParser.reset();
+    g_appNames.clearProvisional();
     markDirtyLocked(millis());
   }
 }

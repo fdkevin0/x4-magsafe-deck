@@ -231,17 +231,36 @@ inline bool isAppAttributeResponseStart(const uint8_t* data, size_t len, const c
   return std::memcmp(data + 1, expectedAppId, cmpLen) == 0;
 }
 
-// Name to show for a notification: the DisplayName iOS reported for the app, or the last
-// component of the bundle identifier until that answer arrives ("com.apple.MobileSMS" -> "MobileSMS").
+// Short names for common iOS bundle identifiers. Used only while iOS has not reported the app's
+// DisplayName (request pending, timed out, or rejected).
+inline const char* friendlyAppName(const char* appId) {
+  if (!appId || appId[0] == '\0') return "iOS";
+  if (std::strstr(appId, "tencent.xin")) return "WeChat";
+  if (std::strstr(appId, "MobileSMS")) return "Messages";
+  if (std::strstr(appId, "mobilephone")) return "Phone";
+  if (std::strstr(appId, "mobilemail")) return "Mail";
+  if (std::strstr(appId, "mobilecal")) return "Calendar";
+  if (std::strstr(appId, "reminders")) return "Reminders";
+  if (std::strstr(appId, "telegra")) return "Telegram";
+  if (std::strstr(appId, "whatsapp")) return "WhatsApp";
+  if (std::strstr(appId, "slack")) return "Slack";
+  if (std::strstr(appId, "dingtalk")) return "DingTalk";
+  if (std::strstr(appId, "lark") || std::strstr(appId, "feishu")) return "Feishu";
+  const char* lastDot = std::strrchr(appId, '.');
+  return (lastDot && lastDot[1] != '\0') ? (lastDot + 1) : appId;
+}
+
+// Name to show for a notification: the DisplayName iOS reported for the app, falling back to
+// friendlyAppName() until (or unless) that answer arrives.
 inline const char* displayAppName(const AncsNotification& item) {
   if (item.appName[0] != '\0') return item.appName;
-  if (item.appId[0] == '\0') return "iOS";
-  const char* lastDot = std::strrchr(item.appId, '.');
-  return (lastDot && lastDot[1] != '\0') ? (lastDot + 1) : item.appId;
+  return friendlyAppName(item.appId);
 }
 
 // Fixed-capacity appId -> DisplayName cache, replacing the oldest entry when full. An empty
-// name is cached too, so an app iOS reports no name for is not asked about again.
+// name is cached too, so an app iOS reports no name for is not asked about again. Entries put
+// with `provisional = true` (e.g. a timed-out request) are dropped by clearProvisional(), so
+// the app is asked again on the next connection.
 // Not thread-safe: callers serialize access.
 template <size_t N>
 class AppNameCache {
@@ -257,7 +276,7 @@ class AppNameCache {
     return nullptr;
   }
 
-  void put(const char* appId, const char* name) {
+  void put(const char* appId, const char* name, bool provisional = false) {
     if (!appId || appId[0] == '\0' || std::strlen(appId) >= AncsNotification::kAppIdMax) return;
     Entry* slot = nullptr;
     for (size_t i = 0; i < count_; ++i) {
@@ -276,6 +295,21 @@ class AppNameCache {
     if (n > 0) std::memcpy(slot->name, name, n);
     slot->name[n] = '\0';
     utf8SafeTruncate(slot->name, n);
+    slot->provisional = provisional;
+  }
+
+  // Drop every provisional entry, keeping the others in insertion order.
+  void clearProvisional() {
+    size_t w = 0;
+    for (size_t i = 0; i < count_; ++i) {
+      if (!entries_[i].provisional) {
+        if (w != i) entries_[w] = entries_[i];
+        ++w;
+      }
+    }
+    for (size_t i = w; i < count_; ++i) entries_[i] = Entry{};
+    count_ = w;
+    next_ = (count_ == N) ? next_ : 0;
   }
 
   size_t size() const { return count_; }
@@ -284,6 +318,7 @@ class AppNameCache {
   struct Entry {
     char appId[AncsNotification::kAppIdMax] = {0};
     char name[AncsNotification::kAppNameMax] = {0};
+    bool provisional = false;
   };
   std::array<Entry, N> entries_{};
   size_t count_ = 0;

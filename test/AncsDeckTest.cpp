@@ -241,7 +241,7 @@ TEST(AncsProtocolTest, HandlesZeroLengthAttributesCleanly) {
 
   ASSERT_TRUE(completed.valid);
   EXPECT_EQ(completed.uid, 7U);
-  EXPECT_STREQ(ancs::displayAppName(completed), "MobileSMS");
+  EXPECT_STREQ(ancs::displayAppName(completed), "Messages");
   EXPECT_STREQ(completed.title, "");
   EXPECT_STREQ(completed.message, "Verification code: 849201");
 }
@@ -697,10 +697,26 @@ TEST(AncsAppAttributesTest, CacheAndDisplayNameFallback) {
   EXPECT_STREQ(cache.find("com.c"), "Gamma2");
   EXPECT_EQ(cache.size(), 2U);
 
+  // Provisional (timeout) entries are dropped on clearProvisional; iOS answers survive.
+  ancs::AppNameCache<3> conn;
+  conn.put("com.ok", "Ok");
+  conn.put("com.timeout", "", /*provisional=*/true);
+  conn.put("com.empty", "");
+  conn.clearProvisional();
+  EXPECT_EQ(conn.size(), 2U);
+  EXPECT_EQ(conn.find("com.timeout"), nullptr);
+  EXPECT_STREQ(conn.find("com.ok"), "Ok");
+  EXPECT_STREQ(conn.find("com.empty"), "");
+  conn.put("com.timeout", "Later");  // a later real answer replaces nothing stale
+  EXPECT_STREQ(conn.find("com.timeout"), "Later");
+
   ancs::AncsNotification item{};
   EXPECT_STREQ(ancs::displayAppName(item), "iOS");
+  std::strcpy(item.appId, "com.tencent.xin");
+  EXPECT_STREQ(ancs::displayAppName(item), "WeChat");  // friendlyAppName fallback
+  std::strcpy(item.appId, "com.example.notes");
+  EXPECT_STREQ(ancs::displayAppName(item), "notes");
   std::strcpy(item.appId, "com.apple.MobileSMS");
-  EXPECT_STREQ(ancs::displayAppName(item), "MobileSMS");
   std::strcpy(item.appName, "Messages");
   EXPECT_STREQ(ancs::displayAppName(item), "Messages");
 
