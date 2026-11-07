@@ -9,9 +9,11 @@
 #include "Utf8.h"
 #include "network/AncsNotificationList.h"
 #include "network/AncsProtocol.h"
+#include "network/AppleBleParams.h"
 #include "network/FirmwareBoardTag.h"
 #include "network/FirmwareImageVerify.h"
 #include "network/MagSafeBadgeStore.h"
+#include "network/OtaSeq.h"
 #include "util/PowerPolicy.h"
 #include "util/QrLayout.h"
 #include "qrcodegen.h"
@@ -568,4 +570,56 @@ TEST(QrLayoutTest, ReservesFourModuleQuietZone) {
   // Too small to fit even 1 px modules plus quiet zone.
   EXPECT_EQ(qr_layout::fit(57, 0, 0, 60, 60).modulePx, 0);
   EXPECT_EQ(qr_layout::fit(0, 0, 0, 100, 100).modulePx, 0);
+}
+
+TEST(AppleBleParamsTest, ValidatesQa1931ConnectionRules) {
+  // Shipped parameters: 30-60 ms, latency 4, 4 s.
+  EXPECT_TRUE(apple_ble::connParamsValid(24, 48, 4, 400));
+  // Apple's max-latency option is also legal: 60 ms * 31 = 1.86 s <= 2 s, x3 = 5.58 s < 6 s.
+  EXPECT_TRUE(apple_ble::connParamsValid(24, 48, 30, 600));
+  EXPECT_TRUE(apple_ble::connParamsValid(12, 12, 0, 200));    // Min == Max == 15 ms is allowed
+  EXPECT_FALSE(apple_ble::connParamsValid(16, 48, 4, 400));   // 20 ms min is not a multiple of 15 ms
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 30, 4, 400));   // Min + 15 ms > Max
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 48, 31, 600));  // latency > 30
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 48, 30, 400));  // 1.86 s * 3 >= 4 s timeout
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 48, 4, 700));   // timeout > 6 s
+  EXPECT_FALSE(apple_ble::connParamsValid(24, 48, 0, 150));   // timeout < 2 s
+}
+
+TEST(AppleBleParamsTest, AdvertisingIntervalsMatchAppleList) {
+  EXPECT_EQ(apple_ble::kFastAdvIntervalUnits * 625, 20000);  // 20 ms in microseconds
+  bool found = false;
+  for (const auto units : apple_ble::kAppleSlowAdvIntervalsUnits) {
+    found |= (units == apple_ble::kSlowAdvIntervalUnits);
+  }
+  EXPECT_TRUE(found);
+  EXPECT_EQ(apple_ble::kSlowAdvIntervalUnits * 625, 1022500);  // 1022.5 ms exactly
+  // Every listed Apple interval converts exactly to 0.625 ms units.
+  const uint32_t appleUs[] = {152500, 211250, 318750, 417500, 546250, 760000, 852500, 1022500, 1285000};
+  for (size_t i = 0; i < 9; ++i) {
+    EXPECT_EQ(apple_ble::kAppleSlowAdvIntervalsUnits[i] * 625u, appleUs[i]);
+  }
+}
+
+TEST(OtaSeqTest, PicksSlotAndWrapsAboveOtherSlot) {
+  // (seq - 1) % 2 selects the OTA slot, and the new seq must beat the active one.
+  auto p = ota_boot::planNextSeq(5, 1);  // active seq 5 -> ota_0; switch to ota_1
+  EXPECT_EQ(p.seq, 6u);
+  EXPECT_FALSE(p.wrapped);
+  p = ota_boot::planNextSeq(5, 0);
+  EXPECT_EQ(p.seq, 7u);
+  EXPECT_EQ((p.seq - 1) % 2, 0u);
+  p = ota_boot::planNextSeq(0, 0);  // fresh otadata
+  EXPECT_EQ(p.seq, 1u);
+
+  // Near UINT32_MAX the seq wraps; the caller must then erase the other sector (wrapped == true),
+  // because a small seq alone would lose to the old entry.
+  p = ota_boot::planNextSeq(0xFFFFFFFCu, 1);
+  EXPECT_TRUE(p.wrapped);
+  EXPECT_EQ(p.seq, 2u);
+  EXPECT_LT(p.seq, 0xFFFFFFFCu);
+  p = ota_boot::planNextSeq(0xFFFFFFFBu, 0);
+  EXPECT_FALSE(p.wrapped);
+  EXPECT_EQ(p.seq, 0xFFFFFFFDu);  // never 0xFFFFFFFF (erased flash)
+  EXPECT_EQ((p.seq - 1) % 2, 0u);
 }

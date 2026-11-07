@@ -61,10 +61,8 @@ bool switchTo(const esp_partition_t* dest) {
     return false;
   }
 
-  // Guard sequence overflow near UINT32_MAX (0xFFFFFFFFu is reserved for erased flash).
-  uint32_t baseSeq = (activeSeq >= 0xFFFFFFFCu) ? 0u : activeSeq;
-  uint32_t newSeq = baseSeq + 1u;
-  while (((newSeq - 1u) % 2u) != (destOtaIdx % 2u)) ++newSeq;
+  const SeqPlan plan = planNextSeq(activeSeq, destOtaIdx);
+  const uint32_t newSeq = plan.seq;
 
   SelectEntry next = {};
   next.ota_seq = newSeq;
@@ -100,6 +98,18 @@ bool switchTo(const esp_partition_t* dest) {
 
   LOG_INF("BOOT", "otadata: wrote slot=%d seq=%u crc=0x%08x -> %s", targetSlot, static_cast<unsigned>(newSeq),
           static_cast<unsigned>(next.crc), dest->label);
+
+  if (plan.wrapped) {
+    // The new entry restarted from a small seq, but the bootloader picks the highest valid seq, so the
+    // other sector (holding a seq near UINT32_MAX) would still win. Invalidate it now that the new
+    // entry is on flash; if power fails in between, the old mapping simply stays in effect.
+    const size_t otherOff = static_cast<size_t>(1 - targetSlot) * SPI_FLASH_SEC_SIZE;
+    if (esp_partition_erase_range(otadata, otherOff, SPI_FLASH_SEC_SIZE) != ESP_OK) {
+      LOG_ERR("BOOT", "otadata: seq wrapped but erasing slot=%d failed", 1 - targetSlot);
+      return false;
+    }
+    LOG_INF("BOOT", "otadata: seq wrapped; erased slot=%d", 1 - targetSlot);
+  }
   return true;
 }
 
