@@ -4,6 +4,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 #include "AncsProtocol.h"
 
@@ -48,6 +49,19 @@ class NotificationList {
     for (size_t i = count_; i < N; ++i) {
       items_[i].clear();
     }
+  }
+
+  // Set the display name on every entry from `appId`. Returns true when any entry changed.
+  bool setAppName(const char* appId, const char* name) {
+    bool changed = false;
+    for (size_t i = 0; i < count_; ++i) {
+      AncsNotification& it = items_[i];
+      if (std::strcmp(it.appId, appId) != 0 || std::strcmp(it.appName, name) == 0) continue;
+      std::strncpy(it.appName, name, sizeof(it.appName) - 1);
+      it.appName[sizeof(it.appName) - 1] = '\0';
+      changed = true;
+    }
+    return changed;
   }
 
   void clear() {
