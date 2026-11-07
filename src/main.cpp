@@ -29,6 +29,7 @@
 #include "network/MagSafeBadgeStore.h"
 #include "network/OtaBootSwitch.h"
 #include "network/SharedFontLoader.h"
+#include "util/PowerPolicy.h"
 #include "util/QrUtils.h"
 #include "util/StringUtils.h"
 
@@ -62,7 +63,7 @@ size_t g_selectedBadgeIdx = 0;
 size_t g_badgeCount = 0;
 bool g_forceFullRefresh = true;
 uint8_t g_partialRefreshCount = 0;
-uint32_t g_lastActivityMs = 0;
+uint32_t g_lastActivityMs = 0;  // Drives both auto-sleep and CPU frequency scaling (applyCpuPowerPolicy).
 
 ancs::AncsNotification g_currentNotif{};
 size_t g_notifCount = 0;
@@ -395,6 +396,28 @@ void switchBackToReaderPartition() {
   }
 }
 
+bool isBleHandshakeActive(const IosAncsService::State s) {
+  return s == IosAncsService::State::ConnectedAuthenticating || s == IosAncsService::State::DiscoveringAncs;
+}
+
+// Run at full speed right after any interaction or UI update (rendering, SD/TTF font streaming, QR
+// generation and the SPI clocks all scale with the CPU/APB clock) and while BLE pairing / ANCS
+// discovery is in progress; drop to the low-power frequency once idle for IDLE_POWER_SAVING_MS.
+void applyCpuPowerPolicy(const uint32_t nowMs) {
+  const bool lowPower = power_policy::shouldUseLowPower(nowMs, g_lastActivityMs, HalPowerManager::IDLE_POWER_SAVING_MS,
+                                                        isBleHandshakeActive(IosAncsService::getInstance().state()));
+  powerManager.setPowerSaving(lowPower);
+}
+
+// Actions are rejected while ANCS is not subscribed (the shown UIDs belong to a previous session).
+// Flash a short hint so the button press is not silently ignored; returns true so the caller redraws
+// the frame underneath the popup.
+bool showNotConnectedHint() {
+  drawPopupMessage("iPhone not connected");
+  delay(600);
+  return true;
+}
+
 void syncNotificationSelection() {
   g_notifCount = IosAncsService::getInstance().notificationCount();
   if (g_selectedNotifIdx >= g_notifCount && g_notifCount > 0) {
@@ -452,7 +475,6 @@ void setup() {
   g_forceFullRefresh = true;
   renderDeckFrame();
 
-  powerManager.setPowerSaving(true);
   g_lastActivityMs = millis();
 }
 
@@ -460,6 +482,11 @@ void loop() {
   gpio.update();
   const uint32_t now = millis();
   bool dirty = false;
+
+  // consumeUiDirty() runs the blocking ANCS discovery inside poll(); if a bonded iPhone reconnected
+  // since the last iteration the state is already ConnectedAuthenticating / DiscoveringAncs, so switch
+  // to full speed first.
+  applyCpuPowerPolicy(now);
 
   if (IosAncsService::getInstance().consumeUiDirty()) {
     g_ancsState = IosAncsService::getInstance().state();
@@ -471,6 +498,9 @@ void loop() {
   if (gpio.wasAnyPressed() || gpio.wasAnyReleased()) {
     g_lastActivityMs = now;
   }
+
+  // Restore full speed before handling input / rendering; re-enter low power only when idle.
+  applyCpuPowerPolicy(now);
 
   if (gpio.wasPressed(HalGPIO::BTN_LEFT)) {
     g_activeTab = (g_activeTab == DeckTab::Notifications) ? DeckTab::BadgeVault : DeckTab::Notifications;
@@ -495,9 +525,12 @@ void loop() {
   if (gpio.wasReleased(HalGPIO::BTN_CONFIRM)) {
     if (g_activeTab == DeckTab::Notifications) {
       if (g_selectedNotifIdx < g_notifCount && g_currentNotif.valid) {
-        IosAncsService::getInstance().dismissNotification(g_currentNotif.uid);
-        syncNotificationSelection();
-        dirty = true;
+        if (IosAncsService::getInstance().dismissNotification(g_currentNotif.uid)) {
+          syncNotificationSelection();
+          dirty = true;
+        } else {
+          dirty |= showNotConnectedHint();
+        }
       }
     } else {
       lockPassAndDeepSleep();
@@ -508,9 +541,12 @@ void loop() {
   if (gpio.wasReleased(HalGPIO::BTN_POWER) && g_activeTab == DeckTab::Notifications) {
     if (g_selectedNotifIdx < g_notifCount && g_currentNotif.valid &&
         (g_currentNotif.eventFlags & ancs::kEventFlagPositiveAction) != 0) {
-      IosAncsService::getInstance().performAction(g_currentNotif.uid, ancs::ActionId::Positive);
-      syncNotificationSelection();
-      dirty = true;
+      if (IosAncsService::getInstance().performAction(g_currentNotif.uid, ancs::ActionId::Positive)) {
+        syncNotificationSelection();
+        dirty = true;
+      } else {
+        dirty |= showNotConnectedHint();
+      }
     }
   }
 

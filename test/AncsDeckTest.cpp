@@ -1,15 +1,18 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "Utf8.h"
+#include "network/AncsNotificationList.h"
 #include "network/AncsProtocol.h"
 #include "network/FirmwareBoardTag.h"
 #include "network/FirmwareImageVerify.h"
 #include "network/MagSafeBadgeStore.h"
+#include "util/PowerPolicy.h"
 #include "util/StringUtils.h"
 
 namespace {
@@ -352,4 +355,71 @@ TEST(StringUtilsTest, AsciiCaseCmpComparesCaseInsensitively) {
   EXPECT_EQ(StringUtils::asciiCaseCmp(".Json", ".JSON"), 0);
   EXPECT_LT(StringUtils::asciiCaseCmp("abc", "abd"), 0);
   EXPECT_GT(StringUtils::asciiCaseCmp("abd", "ABC"), 0);
+}
+
+namespace {
+ancs::AncsNotification makeNotif(uint32_t uid, const char* title) {
+  ancs::AncsNotification n{};
+  n.uid = uid;
+  n.valid = true;
+  std::snprintf(n.title, sizeof(n.title), "%s", title);
+  return n;
+}
+}  // namespace
+
+TEST(AncsNotificationListTest, UpsertsNewestFirstDedupesAndEvictsOldest) {
+  ancs::NotificationList<3> list;
+  list.upsertFront(makeNotif(1, "a"));
+  list.upsertFront(makeNotif(2, "b"));
+  list.upsertFront(makeNotif(3, "c"));
+  ASSERT_EQ(list.size(), 3u);
+  EXPECT_EQ(list.at(0).uid, 3u);
+  EXPECT_EQ(list.at(2).uid, 1u);
+
+  // Re-announcing an existing UID moves it to the front without duplicating it.
+  list.upsertFront(makeNotif(1, "a2"));
+  ASSERT_EQ(list.size(), 3u);
+  EXPECT_EQ(list.at(0).uid, 1u);
+  EXPECT_STREQ(list.at(0).title, "a2");
+  EXPECT_EQ(list.at(1).uid, 3u);
+  EXPECT_EQ(list.at(2).uid, 2u);
+
+  // A fourth UID evicts the oldest entry (uid 2).
+  list.upsertFront(makeNotif(4, "d"));
+  ASSERT_EQ(list.size(), 3u);
+  EXPECT_EQ(list.at(0).uid, 4u);
+  EXPECT_EQ(list.at(1).uid, 1u);
+  EXPECT_EQ(list.at(2).uid, 3u);
+}
+
+TEST(AncsNotificationListTest, RemoveAndClearDropStaleEntries) {
+  ancs::NotificationList<4> list;
+  list.upsertFront(makeNotif(10, "x"));
+  list.upsertFront(makeNotif(11, "y"));
+  list.upsertFront(makeNotif(12, "z"));
+
+  EXPECT_TRUE(list.remove(11));
+  EXPECT_FALSE(list.remove(11));
+  ASSERT_EQ(list.size(), 2u);
+  EXPECT_EQ(list.at(0).uid, 12u);
+  EXPECT_EQ(list.at(1).uid, 10u);
+  EXPECT_FALSE(list.at(2).valid);
+
+  // Reconnect path: stale UIDs from the previous session must all disappear.
+  list.clear();
+  EXPECT_EQ(list.size(), 0u);
+  EXPECT_FALSE(list.remove(10));
+  for (size_t i = 0; i < list.capacity(); ++i) {
+    EXPECT_FALSE(list.at(i).valid);
+  }
+}
+
+TEST(PowerPolicyTest, LowPowerOnlyWhenIdleAndNoBleHandshake) {
+  constexpr uint32_t kIdle = 3000;
+  EXPECT_FALSE(power_policy::shouldUseLowPower(1000, 0, kIdle, false));
+  EXPECT_TRUE(power_policy::shouldUseLowPower(3000, 0, kIdle, false));
+  EXPECT_FALSE(power_policy::shouldUseLowPower(10000, 0, kIdle, true));
+  // millis() wrap-around: 200 ms after an interaction just before overflow is not idle.
+  EXPECT_FALSE(power_policy::shouldUseLowPower(100, 0xFFFFFF9Cu, kIdle, false));
+  EXPECT_TRUE(power_policy::shouldUseLowPower(5000, 0xFFFFFF9Cu, kIdle, false));
 }
