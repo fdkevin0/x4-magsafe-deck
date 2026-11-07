@@ -132,7 +132,8 @@ size_t parseCardsText(std::string_view content, std::array<BadgeCard, N>& outCar
 
 // Incremental cards.txt parser: feed the file in arbitrary chunks (no need to hold the whole file in
 // RAM) and stop reading once `full()`. Lines longer than kMaxLineBytes cannot be a valid card (the
-// fields are much smaller) and are skipped instead of truncated, so a QR payload is never cut silently.
+// fields are much smaller) and are skipped instead of truncated. Within an accepted line, each field
+// is still clipped to its BadgeCard buffer by parseCardLine (e.g. QR payloads to kQrMax - 1 bytes).
 template <size_t N>
 class CardsTextStreamParser {
  public:

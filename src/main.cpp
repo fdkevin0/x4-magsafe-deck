@@ -56,6 +56,9 @@ constexpr uint32_t kIdleAutoSleepMs = 20UL * 60UL * 1000UL;  // 20 minutes witho
 constexpr uint32_t kPowerOnHoldMs = 500;
 // Holding Power this long inside the deck locks the current pass on screen and powers off.
 constexpr uint32_t kPowerOffHoldMs = 1500;
+// A Power release only counts as a short press (positive action) below this hold time, so letting go
+// part-way through the power-off hold cannot accidentally accept a call.
+constexpr uint32_t kPowerShortPressMaxMs = 600;
 
 enum class DeckTab : uint8_t {
   Notifications,
@@ -619,7 +622,8 @@ void loop() {
     }
   }
 
-  if (powerArmed && gpio.wasReleased(HalGPIO::BTN_POWER) && g_activeTab == DeckTab::Notifications) {
+  if (powerArmed && gpio.wasReleased(HalGPIO::BTN_POWER) && g_activeTab == DeckTab::Notifications &&
+      gpio.getPowerButtonHeldTime() < kPowerShortPressMaxMs) {
     if (g_selectedNotifIdx < g_notifCount && g_currentNotif.valid &&
         (g_currentNotif.eventFlags & ancs::kEventFlagPositiveAction) != 0) {
       if (IosAncsService::getInstance().performAction(g_currentNotif.uid, ancs::ActionId::Positive)) {

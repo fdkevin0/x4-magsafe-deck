@@ -29,7 +29,7 @@ By leveraging the X4's 16 MB dual-OTA partition table (`app0` @ `0x010000` + `ap
 
 5. **Power Button Behavior**
    - Cold boot from the power button requires a ~0.5 s hold; shorter presses (a bump in a pocket, or the phone pressing on the MagSafe side) power straight back off. Plugging in USB while off only charges.
-   - A short press of **`Power`** on the Notifications tab triggers the positive action (when available); a 1.5 s hold locks the current pass on screen and powers off.
+   - A short press (under 0.6 s) of **`Power`** on the Notifications tab triggers the positive action (when available); a 1.5 s hold locks the current pass on screen and powers off.
 
 ---
 
@@ -155,7 +155,7 @@ EMERGENCY ICE|IF FOUND PLEASE CONTACT|REWARD IF RETURNED|tel:+8613800000000
 Quick WiFi|WIFI:S:Guest;T:WPA;P:secret;;
 ```
 
-`cards.txt` can be any size (comments with `#` are fine); it is streamed line by line and reading stops after 8 cards. Lines longer than 512 bytes are skipped.
+`cards.txt` can be any size (comments with `#` are fine); it is streamed line by line and reading stops after 8 cards. Lines longer than 512 bytes are skipped; within a line each field is clipped to its limit (QR payload: 255 bytes).
 
 Or place individual `/badges/*.json` files (`{"tag":"...","title":"...","subtitle":"...","meta":"...","qr":"..."}`; `"detail"` is also accepted as an alias for `"meta"`) or `/badges/*.bmp` BMP images.
 
