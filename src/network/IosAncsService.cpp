@@ -62,6 +62,9 @@ NimBLERemoteCharacteristic* g_ctrlPointChr = nullptr;
 
 // Guarded by g_ancsMutex:
 uint16_t g_connHandle = BLE_HS_CONN_HANDLE_NONE;
+// Incremented on every connect / disconnect. NimBLE reuses conn handles (single-connection builds
+// almost always get the same value), so the handle alone cannot tell a reconnect from the same link.
+uint32_t g_connGeneration = 0;
 bool g_peerCleanupNeeded = false;
 bool g_needDiscovery = false;
 uint8_t g_discoveryRetries = 0;
@@ -141,6 +144,12 @@ bool popPendingUidLocked(PendingUidEntry& out) {
   g_pendingTail = (g_pendingTail + 1) % kPendingQueueCap;
   --g_pendingCount;
   return true;
+}
+
+void clearActionsLocked() {
+  g_actionCount = 0;
+  g_actionHead = 0;
+  g_actionTail = 0;
 }
 
 void enqueueActionLocked(uint32_t uid, ancs::ActionId action) {
@@ -386,6 +395,7 @@ void IosAncsService::poll() {
 
   const uint32_t now = millis();
   uint16_t handle = BLE_HS_CONN_HANDLE_NONE;
+  uint32_t generation = 0;
   bool doCleanup = false;
   bool doDiscovery = false;
 
@@ -396,6 +406,7 @@ void IosAncsService::poll() {
       doCleanup = true;
     }
     handle = g_connHandle;
+    generation = g_connGeneration;
     if (g_needDiscovery && handle != BLE_HS_CONN_HANDLE_NONE &&
         static_cast<int32_t>(now - g_nextDiscoveryAttemptMs) >= 0) {
       g_needDiscovery = false;
@@ -414,15 +425,17 @@ void IosAncsService::poll() {
         ScopedLock lock;
         // The peer may have disconnected while the blocking GATT discovery ran on this thread; in that
         // case onPeerDisconnect() already moved the state to Advertising and must not be overwritten.
-        stillConnected = (g_connHandle == handle);
+        stillConnected = (g_connGeneration == generation && g_connHandle == handle);
         if (stillConnected) {
           g_discoveryRetries = 0;
+          // Actions the user queued against the old list while disconnected carry stale UIDs.
+          clearActionsLocked();
           // ANCS UIDs from a previous connection are stale: notifications removed on the phone while we
           // were disconnected never produce a Removed event. iOS re-announces every live notification
           // with the PreExisting flag right after subscription, so rebuild the list from scratch.
           g_items.clear();
-          // Publish the new state while still holding the lock so a concurrent onPeerDisconnect()
-          // (which also takes the lock before storing Advertising) is always ordered after it.
+          // Publish the new state while still holding the lock: every g_state transition driven by the
+          // connection lifecycle is stored under g_ancsMutex, so they are totally ordered.
           g_state.store(State::SubscribedReady);
           markDirtyLocked(millis());
         }
@@ -437,7 +450,7 @@ void IosAncsService::poll() {
       bool shouldDisconnect = false;
       {
         ScopedLock lock;
-        if (g_connHandle == handle) {
+        if (g_connGeneration == generation && g_connHandle == handle) {
           ++g_discoveryRetries;
           if (g_discoveryRetries < kMaxDiscoveryRetries) {
             g_needDiscovery = true;
@@ -545,6 +558,11 @@ size_t IosAncsService::notificationCount() const {
 
 bool IosAncsService::performAction(uint32_t uid, ancs::ActionId action) {
   ScopedLock lock;
+  // Only act on notifications from the live ANCS session: UIDs shown while disconnected are stale, and
+  // a queued action would otherwise be sent to iOS after the next subscription.
+  if (g_state.load() != State::SubscribedReady) {
+    return false;
+  }
   removeUidLocked(uid);
   removePendingUidLocked(uid);
   enqueueActionLocked(uid, action);
@@ -560,13 +578,14 @@ void IosAncsService::onPeerConnect(uint16_t connHandle) {
   {
     ScopedLock lock;
     g_connHandle = connHandle;
+    ++g_connGeneration;
     g_peerCleanupNeeded = true;
     g_needDiscovery = false;
     g_discoveryRetries = 0;
+    g_state.store(State::ConnectedAuthenticating);
     markDirtyLocked(millis());
   }
 
-  g_state.store(State::ConnectedAuthenticating);
   // Initiate SMP encryption/bonding immediately so iOS exposes ANCS.
   NimBLEDevice::startSecurity(connHandle);
 }
@@ -582,10 +601,9 @@ void IosAncsService::onPeerAuthComplete(uint16_t connHandle, bool encrypted) {
     g_discoveryRetries = 0;
     g_nextDiscoveryAttemptMs = millis();
     g_needDiscovery = true;
+    g_state.store(State::DiscoveringAncs);
     markDirtyLocked(millis());
   }
-
-  g_state.store(State::DiscoveringAncs);
 }
 
 void IosAncsService::onPeerDisconnect() {
@@ -595,6 +613,7 @@ void IosAncsService::onPeerDisconnect() {
       g_state.store(State::Advertising);
     }
     g_connHandle = BLE_HS_CONN_HANDLE_NONE;
+    ++g_connGeneration;
     g_peerCleanupNeeded = true;
     g_needDiscovery = false;
     g_discoveryRetries = 0;

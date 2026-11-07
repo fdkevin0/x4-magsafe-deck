@@ -63,8 +63,7 @@ size_t g_selectedBadgeIdx = 0;
 size_t g_badgeCount = 0;
 bool g_forceFullRefresh = true;
 uint8_t g_partialRefreshCount = 0;
-uint32_t g_lastActivityMs = 0;
-uint32_t g_lastInteractionMs = 0;  // Drives CPU frequency scaling (see applyCpuPowerPolicy).
+uint32_t g_lastActivityMs = 0;  // Drives both auto-sleep and CPU frequency scaling (applyCpuPowerPolicy).
 
 ancs::AncsNotification g_currentNotif{};
 size_t g_notifCount = 0;
@@ -405,9 +404,8 @@ bool isBleHandshakeActive(const IosAncsService::State s) {
 // generation and the SPI clocks all scale with the CPU/APB clock) and while BLE pairing / ANCS
 // discovery is in progress; drop to the low-power frequency once idle for IDLE_POWER_SAVING_MS.
 void applyCpuPowerPolicy(const uint32_t nowMs) {
-  const bool lowPower =
-      power_policy::shouldUseLowPower(nowMs, g_lastInteractionMs, HalPowerManager::IDLE_POWER_SAVING_MS,
-                                      isBleHandshakeActive(IosAncsService::getInstance().state()));
+  const bool lowPower = power_policy::shouldUseLowPower(nowMs, g_lastActivityMs, HalPowerManager::IDLE_POWER_SAVING_MS,
+                                                        isBleHandshakeActive(IosAncsService::getInstance().state()));
   powerManager.setPowerSaving(lowPower);
 }
 
@@ -469,7 +467,6 @@ void setup() {
   renderDeckFrame();
 
   g_lastActivityMs = millis();
-  g_lastInteractionMs = g_lastActivityMs;
 }
 
 void loop() {
@@ -477,17 +474,20 @@ void loop() {
   const uint32_t now = millis();
   bool dirty = false;
 
+  // consumeUiDirty() runs the blocking ANCS discovery inside poll(); if a bonded iPhone reconnected
+  // since the last iteration the state is already ConnectedAuthenticating / DiscoveringAncs, so switch
+  // to full speed first.
+  applyCpuPowerPolicy(now);
+
   if (IosAncsService::getInstance().consumeUiDirty()) {
     g_ancsState = IosAncsService::getInstance().state();
     syncNotificationSelection();
     g_lastActivityMs = now;
-    g_lastInteractionMs = now;
     dirty = true;
   }
 
   if (gpio.wasAnyPressed() || gpio.wasAnyReleased()) {
     g_lastActivityMs = now;
-    g_lastInteractionMs = now;
   }
 
   // Restore full speed before handling input / rendering; re-enter low power only when idle.
