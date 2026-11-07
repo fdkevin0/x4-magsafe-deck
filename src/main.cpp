@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <strings.h>
 
 #include "fontIds.h"
 #include "network/AncsProtocol.h"
@@ -31,7 +32,6 @@
 #include "network/SharedFontLoader.h"
 #include "util/PowerPolicy.h"
 #include "util/QrUtils.h"
-#include "util/StringUtils.h"
 
 GfxRenderer renderer(display);
 
@@ -82,12 +82,15 @@ IosAncsService::State g_ancsState = IosAncsService::State::Stopped;
 std::array<magsafe_badge::BadgeCard, kMaxBadges> g_badges{};
 SharedFontLoader g_sharedFonts{};
 
+static_assert(magsafe_badge::BadgeCard::kQrMax - 1 <= QrUtils::kMaxPayloadBytes,
+              "Badge QR payloads must fit the largest QR version QrUtils draws");
+
 bool hasExtension(const char* name, const char* ext) {
   if (!name || !ext) return false;
   const size_t nameLen = std::strlen(name);
   const size_t extLen = std::strlen(ext);
   if (nameLen <= extLen) return false;
-  return StringUtils::asciiCaseCmp(name + (nameLen - extLen), ext) == 0;
+  return strcasecmp(name + (nameLen - extLen), ext) == 0;
 }
 
 void drawPopupMessage(const char* msg) {

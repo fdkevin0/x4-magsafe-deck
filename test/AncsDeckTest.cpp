@@ -14,7 +14,7 @@
 #include "network/MagSafeBadgeStore.h"
 #include "util/PowerPolicy.h"
 #include "util/QrLayout.h"
-#include "util/StringUtils.h"
+#include "qrcodegen.h"
 
 namespace {
 
@@ -351,11 +351,34 @@ TEST(FirmwareImageVerifyTest, ValidatesHeaderChecksumSha256AndBoardTag) {
             firmware_flash::Result::BAD_SEGMENTS);
 }
 
-TEST(StringUtilsTest, AsciiCaseCmpComparesCaseInsensitively) {
-  EXPECT_EQ(StringUtils::asciiCaseCmp(".BMP", ".bmp"), 0);
-  EXPECT_EQ(StringUtils::asciiCaseCmp(".Json", ".JSON"), 0);
-  EXPECT_LT(StringUtils::asciiCaseCmp("abc", "abd"), 0);
-  EXPECT_GT(StringUtils::asciiCaseCmp("abd", "ABC"), 0);
+TEST(QrCodegenTest, PicksSmallestVersionAndCompactMode) {
+  std::vector<uint8_t> qr(qrcodegen_BUFFER_LEN_MAX);
+  std::vector<uint8_t> tmp(qrcodegen_BUFFER_LEN_MAX);
+
+  // A 60-character uppercase IATA BCBP boarding pass string fits alphanumeric mode.
+  // Byte mode at ECC LOW needs version 4 (78 B); alphanumeric fits in version 3.
+  const char* bcbp = "M1DESMARAIS/LUC       EABC123 YULFRAAC 0834 326J001A0025 100";
+  ASSERT_TRUE(qrcodegen_encodeText(bcbp, tmp.data(), qr.data(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
+                                   qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true));
+  EXPECT_LE(qrcodegen_getSize(qr.data()), 21 + 4 * 2);  // version <= 3
+
+  // Mixed-case UTF-8 text falls back to byte mode and still encodes.
+  const char* cjk = "WIFI:S:\xE5\x92\x96\xE5\x95\xA1;T:WPA;P:secret;;";
+  ASSERT_TRUE(qrcodegen_encodeText(cjk, tmp.data(), qr.data(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
+                                   qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true));
+  EXPECT_GE(qrcodegen_getSize(qr.data()), 21);
+
+  // QrUtils caps the version at 10: 271 bytes of byte-mode text fit, 272 do not,
+  // and buffers sized for version 10 are enough.
+  std::vector<uint8_t> qr10(qrcodegen_BUFFER_LEN_FOR_VERSION(10));
+  std::vector<uint8_t> tmp10(qrcodegen_BUFFER_LEN_FOR_VERSION(10));
+  const std::string fits(271, 'x');
+  ASSERT_TRUE(qrcodegen_encodeText(fits.c_str(), tmp10.data(), qr10.data(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
+                                   10, qrcodegen_Mask_AUTO, true));
+  EXPECT_EQ(qrcodegen_getSize(qr10.data()), 21 + 4 * 9);
+  const std::string tooLong(272, 'x');
+  EXPECT_FALSE(qrcodegen_encodeText(tooLong.c_str(), tmp10.data(), qr10.data(), qrcodegen_Ecc_LOW,
+                                    qrcodegen_VERSION_MIN, 10, qrcodegen_Mask_AUTO, true));
 }
 
 namespace {

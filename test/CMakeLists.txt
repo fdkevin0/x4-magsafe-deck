@@ -23,6 +23,7 @@ add_executable(AncsDeckTest
   AncsDeckTest.cpp
   ../src/network/FirmwareBoardTag.cpp
   ../lib/Utf8/Utf8.cpp
+  ../lib/qrcodegen/src/qrcodegen.c
 )
 target_compile_definitions(AncsDeckTest PRIVATE FREEINK_DEVICE_X4=1)
 target_include_directories(AncsDeckTest PRIVATE
@@ -33,6 +34,7 @@ target_include_directories(AncsDeckTest PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../lib
   ${CMAKE_CURRENT_SOURCE_DIR}/../lib/Memory
   ${CMAKE_CURRENT_SOURCE_DIR}/../lib/Utf8
+  ${CMAKE_CURRENT_SOURCE_DIR}/../lib/qrcodegen/src
 )
 target_link_libraries(AncsDeckTest PRIVATE GTest::gtest_main)
 gtest_discover_tests(AncsDeckTest)
