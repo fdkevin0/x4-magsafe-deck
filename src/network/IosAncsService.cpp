@@ -17,6 +17,7 @@
 #include <esp_heap_caps.h>
 
 #include "AncsNotificationList.h"
+#include "AppleBleParams.h"
 
 namespace {
 
@@ -210,10 +211,20 @@ void setLastError(const char* what) {
   LOG_ERR("ANCS", "%s", g_lastError);
 }
 
-void startAdvertisingAncs(const char* deviceName) {
+char g_deviceName[32] = "X4-MagSafe";
+// Set by onPeerDisconnect() (NimBLE host task) and consumed by poll() on the foreground thread.
+std::atomic<bool> g_restartFastAdvertising{false};
+
+void startAdvertisingAncs(const char* deviceName, bool fast) {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   if (!adv) return;
   adv->stop();
+
+  // Apple QA1931: 20 ms for the first 30 s so iOS discovers / reconnects quickly, then an exact slow
+  // interval. The fast burst is time-limited by NimBLE; poll() switches to the slow interval when it ends.
+  const uint16_t interval = fast ? apple_ble::kFastAdvIntervalUnits : apple_ble::kSlowAdvIntervalUnits;
+  adv->setMinInterval(interval);
+  adv->setMaxInterval(interval);
 
   NimBLEAdvertisementData advData;
   advData.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
@@ -225,7 +236,21 @@ void startAdvertisingAncs(const char* deviceName) {
   scanResp.setName(deviceName ? deviceName : "X4-MagSafe");
   adv->setScanResponseData(scanResp);
 
-  adv->start();
+  adv->start(fast ? apple_ble::kFastAdvDurationMs : 0);
+}
+
+// Foreground-thread advertising management: restart the fast burst after a disconnect, and drop to
+// the slow interval once the 30 s burst has expired without a connection.
+void manageAdvertisingOnOwnerThread() {
+  if (!g_server || g_state.load() != IosAncsService::State::Advertising) return;
+  if (g_server->getConnectedCount() > 0) return;  // a connection is being set up; leave it alone
+  NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
+  if (!adv) return;
+  if (g_restartFastAdvertising.exchange(false)) {
+    startAdvertisingAncs(g_deviceName, /*fast=*/true);
+  } else if (!adv->isAdvertising()) {
+    startAdvertisingAncs(g_deviceName, /*fast=*/false);
+  }
 }
 
 void cleanupClientOnOwnerThread() {
@@ -276,8 +301,9 @@ bool discoverAndSubscribeAncs(uint16_t connHandle) {
   }
 
   g_ctrlPointChr = ctrlPt;
-  // Request power-friendly peripheral connection parameters (30..60 ms interval, latency 4, timeout 4 s).
-  g_server->updateConnParams(connHandle, 24, 48, 4, 400);
+  // Request power-friendly peripheral connection parameters (see AppleBleParams.h for the rationale).
+  g_server->updateConnParams(connHandle, apple_ble::kConnIntervalMinUnits, apple_ble::kConnIntervalMaxUnits,
+                             apple_ble::kConnLatency, apple_ble::kConnSupervisionTimeoutUnits);
   return true;
 }
 
@@ -322,7 +348,8 @@ bool IosAncsService::begin(const char* deviceName) {
     return false;
   }
   g_server->setCallbacks(&g_serverCallbacks);
-  g_server->advertiseOnDisconnect(true);
+  // Advertising is restarted by poll() (fast burst first) instead of NimBLE reusing the last interval.
+  g_server->advertiseOnDisconnect(false);
 
   {
     ScopedLock lock;
@@ -345,7 +372,9 @@ bool IosAncsService::begin(const char* deviceName) {
   g_ctrlPointChr = nullptr;
   g_client = nullptr;
   g_state.store(State::Advertising);
-  startAdvertisingAncs(deviceName);
+  std::snprintf(g_deviceName, sizeof(g_deviceName), "%s", deviceName ? deviceName : "X4-MagSafe");
+  g_restartFastAdvertising.store(false);
+  startAdvertisingAncs(g_deviceName, /*fast=*/true);
 
   g_running.store(true);
   LOG_INF("ANCS", "Started iOS ANCS advertising as '%s'", deviceName ? deviceName : "X4-MagSafe");
@@ -430,6 +459,8 @@ void IosAncsService::poll() {
   if (doCleanup) {
     cleanupClientOnOwnerThread();
   }
+
+  manageAdvertisingOnOwnerThread();
 
   if (doDiscovery && handle != BLE_HS_CONN_HANDLE_NONE) {
     if (discoverAndSubscribeAncs(handle)) {
@@ -630,6 +661,7 @@ void IosAncsService::onPeerDisconnect() {
     g_connHandle = BLE_HS_CONN_HANDLE_NONE;
     ++g_connGeneration;
     g_peerCleanupNeeded = true;
+    g_restartFastAdvertising.store(true);
     g_needDiscovery = false;
     g_discoveryRetries = 0;
     g_requestInFlight = false;
