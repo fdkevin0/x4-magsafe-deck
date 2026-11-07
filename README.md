@@ -20,7 +20,7 @@ By leveraging the X4's 16 MB dual-OTA partition table (`app0` @ `0x010000` + `ap
 
 3. **MagSafe Zero-Power Badge / Boarding Pass / Card Vault**
    - Loads `/badges/cards.txt`, `/badges/*.json`, or `/badges/*.bmp` from the MicroSD card (skipping hidden `.*` / macOS `._*` files and falling back to built-in default passes when no SD card is inserted).
-   - Renders high-contrast QR codes (`ricmoo/QRCode`, auto-selecting Byte-mode QR versions 4–40) + pass metadata (`Tag`, `Title`, `Subtitle`, `Meta`).
+   - Renders high-contrast QR codes (vendored `nayuki/QR-Code-generator`, auto-selecting the smallest QR version and numeric / alphanumeric / byte mode) + pass metadata (`Tag`, `Title`, `Subtitle`, `Meta`).
    - **Zero-Power Lock (`Lock Pass & Sleep`)**: Press **`Confirm`** on the Badge Vault tab (or after 20 minutes of inactivity) to perform a clean `FULL_REFRESH` and immediately enter ESP32-C3 deep sleep while retaining the E-Ink image at **0 W** power consumption—keeping boarding passes, train tickets, and contact QR badges scannable even if the battery is completely depleted.
 
 4. **Shared CJK / Non-Latin Font Library with CrossPoint Reader**
@@ -54,8 +54,7 @@ x4-magsafe-deck/
 │   │   ├── UsbSerialJtagHandoff.{h,cpp}    # ESP32-C3 USB Serial/JTAG boot handoff
 │   │   └── skip_efuse_blk_check.c          # Linker wrapper for X4 efuse block revision check
 │   └── util/
-│       ├── QrUtils.{h,cpp}                 # Byte-mode auto-version E-Ink QR code renderer
-│       └── StringUtils.h                   # Case-insensitive ASCII comparison helper
+│       ├── QrUtils.{h,cpp}                 # Auto-version, auto-mode E-Ink QR code renderer (qrcodegen)
 ├── patches/
 │   └── crosspoint-dualboot-switcher.patch  # Minimal patch adding dual-boot switching to CrossPoint Reader
 ├── scripts/

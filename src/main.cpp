@@ -22,6 +22,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <strings.h>
 
 #include "fontIds.h"
 #include "network/AncsProtocol.h"
@@ -30,7 +31,6 @@
 #include "network/OtaBootSwitch.h"
 #include "network/SharedFontLoader.h"
 #include "util/QrUtils.h"
-#include "util/StringUtils.h"
 
 GfxRenderer renderer(display);
 
@@ -75,7 +75,7 @@ bool hasExtension(const char* name, const char* ext) {
   const size_t nameLen = std::strlen(name);
   const size_t extLen = std::strlen(ext);
   if (nameLen <= extLen) return false;
-  return StringUtils::asciiCaseCmp(name + (nameLen - extLen), ext) == 0;
+  return strcasecmp(name + (nameLen - extLen), ext) == 0;
 }
 
 void drawPopupMessage(const char* msg) {

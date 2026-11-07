@@ -10,7 +10,7 @@
 #include "network/FirmwareBoardTag.h"
 #include "network/FirmwareImageVerify.h"
 #include "network/MagSafeBadgeStore.h"
-#include "util/StringUtils.h"
+#include "qrcodegen.h"
 
 namespace {
 
@@ -347,9 +347,25 @@ TEST(FirmwareImageVerifyTest, ValidatesHeaderChecksumSha256AndBoardTag) {
             firmware_flash::Result::BAD_SEGMENTS);
 }
 
-TEST(StringUtilsTest, AsciiCaseCmpComparesCaseInsensitively) {
-  EXPECT_EQ(StringUtils::asciiCaseCmp(".BMP", ".bmp"), 0);
-  EXPECT_EQ(StringUtils::asciiCaseCmp(".Json", ".JSON"), 0);
-  EXPECT_LT(StringUtils::asciiCaseCmp("abc", "abd"), 0);
-  EXPECT_GT(StringUtils::asciiCaseCmp("abd", "ABC"), 0);
+TEST(QrCodegenTest, PicksSmallestVersionAndCompactMode) {
+  std::vector<uint8_t> qr(qrcodegen_BUFFER_LEN_MAX);
+  std::vector<uint8_t> tmp(qrcodegen_BUFFER_LEN_MAX);
+
+  // A 60-character uppercase IATA BCBP boarding pass string fits alphanumeric mode.
+  // Byte mode at ECC LOW needs version 4 (78 B); alphanumeric fits in version 3.
+  const char* bcbp = "M1DESMARAIS/LUC       EABC123 YULFRAAC 0834 326J001A0025 100";
+  ASSERT_TRUE(qrcodegen_encodeText(bcbp, tmp.data(), qr.data(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
+                                   qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true));
+  EXPECT_LE(qrcodegen_getSize(qr.data()), 21 + 4 * 2);  // version <= 3
+
+  // Mixed-case UTF-8 text falls back to byte mode and still encodes.
+  const char* cjk = "WIFI:S:\xE5\x92\x96\xE5\x95\xA1;T:WPA;P:secret;;";
+  ASSERT_TRUE(qrcodegen_encodeText(cjk, tmp.data(), qr.data(), qrcodegen_Ecc_LOW, qrcodegen_VERSION_MIN,
+                                   qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true));
+  EXPECT_GE(qrcodegen_getSize(qr.data()), 21);
+
+  // A payload above the version 40 byte-mode capacity is rejected, not truncated.
+  const std::string tooLong(2954, 'x');
+  EXPECT_FALSE(qrcodegen_encodeText(tooLong.c_str(), tmp.data(), qr.data(), qrcodegen_Ecc_LOW,
+                                    qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true));
 }
