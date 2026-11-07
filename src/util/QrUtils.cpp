@@ -9,6 +9,7 @@
 
 #include "Logging.h"
 #include "Memory.h"
+#include "QrLayout.h"
 
 void QrUtils::drawQrCode(const GfxRenderer& renderer, const Rect& bounds, const std::string& textPayload) {
   // Payloads longer than the kMaxVersion byte-mode capacity are cut at a UTF-8
@@ -39,17 +40,20 @@ void QrUtils::drawQrCode(const GfxRenderer& renderer, const Rect& bounds, const 
   }
 
   const int size = qrcodegen_getSize(qrcode.get());
-  const int maxDim = std::min(bounds.width, bounds.height);
-  const int px = std::max(1, maxDim / size);
 
-  const int qrDisplaySize = size * px;
-  const int xOff = bounds.x + (bounds.width - qrDisplaySize) / 2;
-  const int yOff = bounds.y + (bounds.height - qrDisplaySize) / 2;
+  // Integer module size that leaves room for the 4-module quiet zone scanners need.
+  const qr_layout::Layout layout = qr_layout::fit(size, bounds.x, bounds.y, bounds.width, bounds.height);
+  if (layout.modulePx < 1) {
+    LOG_ERR("QR", "Bounds %dx%d too small for a %d-module QR code", bounds.width, bounds.height, size);
+    return;
+  }
+  renderer.fillRect(layout.outerX, layout.outerY, layout.outerSide, layout.outerSide, false);
 
+  const int px = layout.modulePx;
   for (int cy = 0; cy < size; cy++) {
     for (int cx = 0; cx < size; cx++) {
       if (qrcodegen_getModule(qrcode.get(), cx, cy)) {
-        renderer.fillRect(xOff + px * cx, yOff + px * cy, px, px, true);
+        renderer.fillRect(layout.originX + px * cx, layout.originY + px * cy, px, px, true);
       }
     }
   }

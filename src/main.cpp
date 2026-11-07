@@ -30,6 +30,7 @@
 #include "network/MagSafeBadgeStore.h"
 #include "network/OtaBootSwitch.h"
 #include "network/SharedFontLoader.h"
+#include "util/PowerPolicy.h"
 #include "util/QrUtils.h"
 
 GfxRenderer renderer(display);
@@ -49,7 +50,15 @@ constexpr const char* kCardsTxtPath = "/badges/cards.txt";
 constexpr size_t kMaxBadgeFileBytes = 2048;
 constexpr size_t kMaxBadges = 8;
 constexpr uint8_t kHalfRefreshCadence = 15;
-constexpr uint32_t kIdleAutoSleepMs = 20UL * 60UL * 1000UL;  // 20 minutes
+constexpr uint32_t kIdleAutoSleepMs = 20UL * 60UL * 1000UL;  // 20 minutes without a button press
+// Cold boot from the power button must be held this long (measured from reset) so a bump in a pocket or
+// bag, or the phone pressing on the MagSafe side, does not power the deck up with BLE for 20 minutes.
+constexpr uint32_t kPowerOnHoldMs = 500;
+// Holding Power this long inside the deck locks the current pass on screen and powers off.
+constexpr uint32_t kPowerOffHoldMs = 1500;
+// A Power release only counts as a short press (positive action) below this hold time, so letting go
+// part-way through the power-off hold cannot accidentally accept a call.
+constexpr uint32_t kPowerShortPressMaxMs = 600;
 
 enum class DeckTab : uint8_t {
   Notifications,
@@ -62,7 +71,10 @@ size_t g_selectedBadgeIdx = 0;
 size_t g_badgeCount = 0;
 bool g_forceFullRefresh = true;
 uint8_t g_partialRefreshCount = 0;
-uint32_t g_lastActivityMs = 0;
+uint32_t g_lastActivityMs = 0;    // Buttons + UI updates: drives CPU frequency scaling (applyCpuPowerPolicy).
+uint32_t g_lastInputMs = 0;       // Buttons only: drives the idle auto-sleep, so a stream of iOS
+                                  // notifications cannot keep the deck awake forever.
+bool g_powerButtonArmed = false;  // Set once Power is seen released after boot (ignore the boot press).
 
 ancs::AncsNotification g_currentNotif{};
 size_t g_notifCount = 0;
@@ -123,9 +135,25 @@ void loadBadgesFromSd() {
 
   if (Storage.ready() && Storage.exists(kBadgesDir)) {
     if (Storage.exists(kCardsTxtPath)) {
-      std::string raw;
-      if (Storage.readFileToString("DECK", kCardsTxtPath, kMaxBadgeFileBytes, raw)) {
-        g_badgeCount = magsafe_badge::parseCardsText(raw, g_badges, g_badgeCount);
+      // Stream the file line by line so any size works (comments, long URLs) and stop as soon as the
+      // vault is full, instead of rejecting the whole file above a fixed byte cap.
+      HalFile cardsFile;
+      if (Storage.openFileForRead("DECK", kCardsTxtPath, cardsFile) && cardsFile) {
+        magsafe_badge::CardsTextStreamParser<kMaxBadges> parser(g_badges, g_badgeCount);
+        char chunk[256];
+        while (!parser.full()) {
+          const int got = cardsFile.read(chunk, sizeof(chunk));
+          if (got <= 0) break;
+          parser.feed(chunk, static_cast<size_t>(got));
+        }
+        parser.finish();
+        cardsFile.close();
+        g_badgeCount = parser.count();
+        if (parser.skippedOverlongLines() > 0) {
+          LOG_ERR("DECK", "cards.txt: skipped %u line(s) longer than %u bytes",
+                  static_cast<unsigned>(parser.skippedOverlongLines()),
+                  static_cast<unsigned>(decltype(parser)::kMaxLineBytes));
+        }
       }
     }
 
@@ -192,8 +220,12 @@ void loadBadgesFromSd() {
 
 void renderNotificationsTab(const int pageWidth, const int pageHeight) {
   const char* statusSub = "Pair 'X4-MagSafe' in iOS Bluetooth Settings";
+  const char* bleError = IosAncsService::getInstance().lastError();
+  const bool bleFailed = g_ancsState == IosAncsService::State::Stopped && bleError && bleError[0] != '\0';
   switch (g_ancsState) {
     case IosAncsService::State::Stopped:
+      statusSub = bleFailed ? bleError : "Pair 'X4-MagSafe' in iOS Bluetooth Settings";
+      break;
     case IosAncsService::State::Advertising:
       statusSub = "Pair 'X4-MagSafe' in iOS Bluetooth Settings";
       break;
@@ -218,8 +250,9 @@ void renderNotificationsTab(const int pageWidth, const int pageHeight) {
   if (g_notifCount == 0 || !g_currentNotif.valid) {
     renderer.drawRect(margin, contentTop, cardWidth, contentBottom - contentTop, 2, true);
     const int centerY = (contentTop + contentBottom) / 2 - 28;
-    const char* emptyTitle =
-        (g_ancsState == IosAncsService::State::SubscribedReady) ? "All Caught Up" : "Waiting for iPhone ANCS";
+    const char* emptyTitle = bleFailed                                                 ? "Bluetooth Unavailable"
+                             : (g_ancsState == IosAncsService::State::SubscribedReady) ? "All Caught Up"
+                                                                                       : "Waiting for iPhone ANCS";
     renderer.drawCenteredText(UI_12_FONT_ID, centerY, emptyTitle, true, EpdFontFamily::BOLD);
     renderer.drawCenteredText(UI_10_FONT_ID, centerY + 34, statusSub, true, EpdFontFamily::REGULAR);
     return;
@@ -329,7 +362,6 @@ void renderBadgeVaultTab(const int pageWidth, const int pageHeight, const bool c
     const int qrAvailH = std::max(80, (topY + availH - 16) - qrTop);
     const int qrSide = std::min(boxW - 40, qrAvailH);
     const int qrX = (pageWidth - qrSide) / 2;
-    renderer.fillRect(qrX - 8, qrTop - 4, qrSide + 16, qrSide + 8, false);
     QrUtils::drawQrCode(renderer, Rect{qrX, qrTop, qrSide, qrSide}, card.qrPayload);
   }
 }
@@ -398,6 +430,48 @@ void switchBackToReaderPartition() {
   }
 }
 
+bool isBleHandshakeActive(const IosAncsService::State s) {
+  return s == IosAncsService::State::ConnectedAuthenticating || s == IosAncsService::State::DiscoveringAncs;
+}
+
+// Run at full speed right after any interaction or UI update (rendering, SD/TTF font streaming, QR
+// generation and the SPI clocks all scale with the CPU/APB clock) and while BLE pairing / ANCS
+// discovery is in progress; drop to the low-power frequency once idle for IDLE_POWER_SAVING_MS.
+void applyCpuPowerPolicy(const uint32_t nowMs) {
+  const bool lowPower = power_policy::shouldUseLowPower(nowMs, g_lastActivityMs, HalPowerManager::IDLE_POWER_SAVING_MS,
+                                                        isBleHandshakeActive(IosAncsService::getInstance().state()));
+  powerManager.setPowerSaving(lowPower);
+}
+
+// Actions are rejected while ANCS is not subscribed (the shown UIDs belong to a previous session).
+// Flash a short hint so the button press is not silently ignored; returns true so the caller redraws
+// the frame underneath the popup.
+bool showNotConnectedHint() {
+  drawPopupMessage("iPhone not connected");
+  delay(600);
+  return true;
+}
+
+// Power off without touching the display (it keeps whatever image it had) or the SD card.
+[[noreturn]] void powerOffNow() {
+  gpio.prepareForDeepSleep();
+  powerManager.startDeepSleep(gpio, false);
+  for (;;) {
+    delay(1000);
+  }
+}
+
+// Returns false when a power-button cold boot was too short to be intentional.
+bool confirmPowerOnHold() {
+  if (!gpio.verifyPowerButtonWakeup()) return false;
+  while (millis() < kPowerOnHoldMs) {
+    gpio.update();
+    if (!gpio.isPressed(HalGPIO::BTN_POWER)) return false;
+    delay(10);
+  }
+  return true;
+}
+
 void syncNotificationSelection() {
   g_notifCount = IosAncsService::getInstance().notificationCount();
   if (g_selectedNotifIdx >= g_notifCount && g_notifCount > 0) {
@@ -429,6 +503,17 @@ void setup() {
   const bool switchBackShortcut =
       powerBoot && (esp_reset_reason() != ESP_RST_SW) && gpio.isPressed(HalGPIO::BTN_LEFT);
 
+  // Accidental-boot guards (same idea as CrossPoint Reader): a power-button boot must be a deliberate
+  // hold, and plugging USB into a powered-off deck only charges instead of starting BLE.
+  if (wakeupReason == HalGPIO::WakeupReason::PowerButton && !confirmPowerOnHold()) {
+    LOG_INF("DECK", "Power button released before %u ms; powering off", static_cast<unsigned>(kPowerOnHoldMs));
+    powerOffNow();
+  }
+  if (wakeupReason == HalGPIO::WakeupReason::AfterUSBPower && !gpio.isPressed(HalGPIO::BTN_POWER)) {
+    LOG_INF("DECK", "USB power-on without button; powering off to charge");
+    powerOffNow();
+  }
+
   Storage.begin();
   HalSystem::checkPanic();
 
@@ -441,28 +526,36 @@ void setup() {
     switchBackToReaderPartition();
   }
 
+  // Start BLE before loading SD fallback fonts: NimBLE needs a large contiguous chunk of the ~320 KB
+  // internal heap, while the font loader already sizes itself from whatever heap is left.
+  const bool bleStarted = IosAncsService::getInstance().begin("X4-MagSafe");
+  LOG_INF("DECK", "BLE %s; free heap %u KB", bleStarted ? "started" : "FAILED",
+          static_cast<unsigned>(ESP.getFreeHeap() / 1024));
+
   g_sharedFonts.begin(renderer);
   loadBadgesFromSd();
 
-  if (IosAncsService::getInstance().begin("X4-MagSafe")) {
-    g_activeTab = DeckTab::Notifications;
-  } else {
-    g_activeTab = DeckTab::BadgeVault;
-  }
+  // Open on Notifications even when BLE failed so the reason is visible instead of silently hidden.
+  g_activeTab = DeckTab::Notifications;
 
   g_ancsState = IosAncsService::getInstance().state();
   syncNotificationSelection();
   g_forceFullRefresh = true;
   renderDeckFrame();
 
-  powerManager.setPowerSaving(true);
   g_lastActivityMs = millis();
+  g_lastInputMs = g_lastActivityMs;
 }
 
 void loop() {
   gpio.update();
   const uint32_t now = millis();
   bool dirty = false;
+
+  // consumeUiDirty() runs the blocking ANCS discovery inside poll(); if a bonded iPhone reconnected
+  // since the last iteration the state is already ConnectedAuthenticating / DiscoveringAncs, so switch
+  // to full speed first.
+  applyCpuPowerPolicy(now);
 
   if (IosAncsService::getInstance().consumeUiDirty()) {
     g_ancsState = IosAncsService::getInstance().state();
@@ -473,7 +566,28 @@ void loop() {
 
   if (gpio.wasAnyPressed() || gpio.wasAnyReleased()) {
     g_lastActivityMs = now;
+    g_lastInputMs = now;
   }
+
+  // Power is "armed" only after it has been seen released since boot, so the press that powered the
+  // deck on can neither trigger a positive action nor count as a power-off hold.
+  const bool powerArmed = g_powerButtonArmed;
+  if (!gpio.isPressed(HalGPIO::BTN_POWER)) {
+    g_powerButtonArmed = true;
+  }
+
+  if (powerArmed && gpio.isPressed(HalGPIO::BTN_POWER) && gpio.getPowerButtonHeldTime() >= kPowerOffHoldMs) {
+    drawPopupMessage("Release to lock pass & power off");
+    while (gpio.isPressed(HalGPIO::BTN_POWER)) {
+      gpio.update();
+      delay(10);
+    }
+    lockPassAndDeepSleep();
+    return;
+  }
+
+  // Restore full speed before handling input / rendering; re-enter low power only when idle.
+  applyCpuPowerPolicy(now);
 
   if (gpio.wasPressed(HalGPIO::BTN_LEFT)) {
     g_activeTab = (g_activeTab == DeckTab::Notifications) ? DeckTab::BadgeVault : DeckTab::Notifications;
@@ -498,9 +612,12 @@ void loop() {
   if (gpio.wasReleased(HalGPIO::BTN_CONFIRM)) {
     if (g_activeTab == DeckTab::Notifications) {
       if (g_selectedNotifIdx < g_notifCount && g_currentNotif.valid) {
-        IosAncsService::getInstance().dismissNotification(g_currentNotif.uid);
-        syncNotificationSelection();
-        dirty = true;
+        if (IosAncsService::getInstance().dismissNotification(g_currentNotif.uid)) {
+          syncNotificationSelection();
+          dirty = true;
+        } else {
+          dirty |= showNotConnectedHint();
+        }
       }
     } else {
       lockPassAndDeepSleep();
@@ -508,12 +625,16 @@ void loop() {
     }
   }
 
-  if (gpio.wasReleased(HalGPIO::BTN_POWER) && g_activeTab == DeckTab::Notifications) {
+  if (powerArmed && gpio.wasReleased(HalGPIO::BTN_POWER) && g_activeTab == DeckTab::Notifications &&
+      gpio.getPowerButtonHeldTime() < kPowerShortPressMaxMs) {
     if (g_selectedNotifIdx < g_notifCount && g_currentNotif.valid &&
         (g_currentNotif.eventFlags & ancs::kEventFlagPositiveAction) != 0) {
-      IosAncsService::getInstance().performAction(g_currentNotif.uid, ancs::ActionId::Positive);
-      syncNotificationSelection();
-      dirty = true;
+      if (IosAncsService::getInstance().performAction(g_currentNotif.uid, ancs::ActionId::Positive)) {
+        syncNotificationSelection();
+        dirty = true;
+      } else {
+        dirty |= showNotConnectedHint();
+      }
     }
   }
 
@@ -522,7 +643,7 @@ void loop() {
     return;
   }
 
-  if ((now - g_lastActivityMs) >= kIdleAutoSleepMs) {
+  if ((now - g_lastInputMs) >= kIdleAutoSleepMs) {
     lockPassAndDeepSleep();
     return;
   }

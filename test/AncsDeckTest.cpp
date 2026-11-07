@@ -1,15 +1,19 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "Utf8.h"
+#include "network/AncsNotificationList.h"
 #include "network/AncsProtocol.h"
 #include "network/FirmwareBoardTag.h"
 #include "network/FirmwareImageVerify.h"
 #include "network/MagSafeBadgeStore.h"
+#include "util/PowerPolicy.h"
+#include "util/QrLayout.h"
 #include "qrcodegen.h"
 
 namespace {
@@ -375,4 +379,193 @@ TEST(QrCodegenTest, PicksSmallestVersionAndCompactMode) {
   const std::string tooLong(272, 'x');
   EXPECT_FALSE(qrcodegen_encodeText(tooLong.c_str(), tmp10.data(), qr10.data(), qrcodegen_Ecc_LOW,
                                     qrcodegen_VERSION_MIN, 10, qrcodegen_Mask_AUTO, true));
+}
+
+namespace {
+ancs::AncsNotification makeNotif(uint32_t uid, const char* title) {
+  ancs::AncsNotification n{};
+  n.uid = uid;
+  n.valid = true;
+  std::snprintf(n.title, sizeof(n.title), "%s", title);
+  return n;
+}
+}  // namespace
+
+TEST(AncsNotificationListTest, UpsertsNewestFirstDedupesAndEvictsOldest) {
+  ancs::NotificationList<3> list;
+  list.upsertFront(makeNotif(1, "a"));
+  list.upsertFront(makeNotif(2, "b"));
+  list.upsertFront(makeNotif(3, "c"));
+  ASSERT_EQ(list.size(), 3u);
+  EXPECT_EQ(list.at(0).uid, 3u);
+  EXPECT_EQ(list.at(2).uid, 1u);
+
+  // Re-announcing an existing UID moves it to the front without duplicating it.
+  list.upsertFront(makeNotif(1, "a2"));
+  ASSERT_EQ(list.size(), 3u);
+  EXPECT_EQ(list.at(0).uid, 1u);
+  EXPECT_STREQ(list.at(0).title, "a2");
+  EXPECT_EQ(list.at(1).uid, 3u);
+  EXPECT_EQ(list.at(2).uid, 2u);
+
+  // A fourth UID evicts the oldest entry (uid 2).
+  list.upsertFront(makeNotif(4, "d"));
+  ASSERT_EQ(list.size(), 3u);
+  EXPECT_EQ(list.at(0).uid, 4u);
+  EXPECT_EQ(list.at(1).uid, 1u);
+  EXPECT_EQ(list.at(2).uid, 3u);
+}
+
+TEST(AncsNotificationListTest, RemoveAndClearDropStaleEntries) {
+  ancs::NotificationList<4> list;
+  list.upsertFront(makeNotif(10, "x"));
+  list.upsertFront(makeNotif(11, "y"));
+  list.upsertFront(makeNotif(12, "z"));
+
+  EXPECT_TRUE(list.remove(11));
+  EXPECT_FALSE(list.remove(11));
+  ASSERT_EQ(list.size(), 2u);
+  EXPECT_EQ(list.at(0).uid, 12u);
+  EXPECT_EQ(list.at(1).uid, 10u);
+  EXPECT_FALSE(list.at(2).valid);
+
+  // Reconnect path: stale UIDs from the previous session must all disappear.
+  list.clear();
+  EXPECT_EQ(list.size(), 0u);
+  EXPECT_FALSE(list.remove(10));
+  for (size_t i = 0; i < list.capacity(); ++i) {
+    EXPECT_FALSE(list.at(i).valid);
+  }
+}
+
+TEST(PowerPolicyTest, LowPowerOnlyWhenIdleAndNoBleHandshake) {
+  constexpr uint32_t kIdle = 3000;
+  EXPECT_FALSE(power_policy::shouldUseLowPower(1000, 0, kIdle, false));
+  EXPECT_TRUE(power_policy::shouldUseLowPower(3000, 0, kIdle, false));
+  EXPECT_FALSE(power_policy::shouldUseLowPower(10000, 0, kIdle, true));
+  // millis() wrap-around: 200 ms after an interaction just before overflow is not idle.
+  EXPECT_FALSE(power_policy::shouldUseLowPower(100, 0xFFFFFF9Cu, kIdle, false));
+  EXPECT_TRUE(power_policy::shouldUseLowPower(5000, 0xFFFFFF9Cu, kIdle, false));
+}
+
+TEST(AncsProtocolTest, SkipsSilentAddedAndModifiedEvents) {
+  ancs::NotificationSourceEvent ev{};
+  ev.eventId = ancs::EventId::Added;
+  ev.eventFlags = 0;
+  EXPECT_TRUE(ancs::shouldFetchAttributes(ev));
+  ev.eventFlags = ancs::kEventFlagSilent;
+  EXPECT_FALSE(ancs::shouldFetchAttributes(ev));
+  ev.eventId = ancs::EventId::Modified;
+  EXPECT_FALSE(ancs::shouldFetchAttributes(ev));
+  ev.eventFlags = ancs::kEventFlagImportant;
+  EXPECT_TRUE(ancs::shouldFetchAttributes(ev));
+  ev.eventId = ancs::EventId::Removed;
+  EXPECT_FALSE(ancs::shouldFetchAttributes(ev));
+}
+
+TEST(AncsProtocolTest, DropsLateFragmentOfTimedOutResponse) {
+  const uint32_t oldUid = 0x11223344u;
+  const uint32_t newUid = 0x55667788u;
+
+  // Full response for the new request.
+  std::vector<uint8_t> resp = {0x00};
+  for (int i = 0; i < 4; ++i) resp.push_back(static_cast<uint8_t>((newUid >> (8 * i)) & 0xFF));
+  appendAttr(resp, ancs::AttributeId::AppIdentifier, "com.apple.MobileSMS");
+  appendAttr(resp, ancs::AttributeId::Title, "Alice");
+  appendAttr(resp, ancs::AttributeId::Message, "hello");
+  appendAttr(resp, ancs::AttributeId::Date, "20261107T101500");
+
+  // A late continuation of the old response whose first byte happens to be 0x00.
+  const std::vector<uint8_t> lateFragment = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 'x', 'y'};
+  EXPECT_FALSE(ancs::isAttributeResponseStart(lateFragment.data(), lateFragment.size(), newUid));
+  EXPECT_TRUE(ancs::isAttributeResponseStart(resp.data(), resp.size(), newUid));
+  EXPECT_FALSE(ancs::isAttributeResponseStart(resp.data(), resp.size(), oldUid));
+  // A header split across packets is accepted by prefix.
+  EXPECT_TRUE(ancs::isAttributeResponseStart(resp.data(), 3, newUid));
+  EXPECT_FALSE(ancs::isAttributeResponseStart(nullptr, 0, newUid));
+
+  // Gate exactly like IosAncsService::onDataSourceBytes and check the real response still parses.
+  ancs::AncsDataSourceParser parser;
+  int completed = 0;
+  ancs::AncsNotification got{};
+  std::pair<int*, ancs::AncsNotification*> ctxPair{&completed, &got};
+  auto feedGated = [&](const std::vector<uint8_t>& pkt) {
+    if (parser.phase() == ancs::AncsDataSourceParser::ParsePhase::CommandId &&
+        !ancs::isAttributeResponseStart(pkt.data(), pkt.size(), newUid)) {
+      return;
+    }
+    parser.feed(
+        pkt.data(), pkt.size(),
+        [](const ancs::AncsNotification& item, void* ctx) {
+          auto* pair = static_cast<std::pair<int*, ancs::AncsNotification*>*>(ctx);
+          ++*pair->first;
+          *pair->second = item;
+        },
+        &ctxPair);
+  };
+  feedGated(lateFragment);
+  feedGated(resp);
+  EXPECT_EQ(completed, 1);
+  EXPECT_EQ(got.uid, newUid);
+  EXPECT_STREQ(got.title, "Alice");
+  EXPECT_STREQ(got.message, "hello");
+}
+
+TEST(MagSafeBadgeStoreTest, StreamParserHandlesChunksLargeFilesAndOverlongLines) {
+  std::string text = "# comment line\r\n";
+  text += std::string(3000, '#') + "\n";                     // >2 KB of comments must not reject the file
+  text += "A|" + std::string(600, 'x') + "\n";               // overlong line is skipped, not truncated
+  for (int i = 0; i < 10; ++i) {
+    text += "TAG|Title " + std::to_string(i) + "|payload-" + std::to_string(i) + "\r\n";
+  }
+
+  std::array<magsafe_badge::BadgeCard, 8> cards{};
+  magsafe_badge::CardsTextStreamParser<8> parser(cards, 0);
+  // Feed in awkward 7-byte chunks so lines straddle chunk boundaries.
+  size_t fed = 0;
+  for (size_t pos = 0; pos < text.size() && !parser.full(); pos += 7) {
+    const size_t n = std::min<size_t>(7, text.size() - pos);
+    parser.feed(text.data() + pos, n);
+    fed = pos + n;
+  }
+  parser.finish();
+
+  EXPECT_TRUE(parser.full());
+  EXPECT_LT(fed, text.size());  // stopped reading once 8 cards were parsed
+  ASSERT_EQ(parser.count(), 8u);
+  EXPECT_EQ(parser.skippedOverlongLines(), 2u);  // the 3000-byte comment and the 600-byte card
+  EXPECT_STREQ(cards[0].title, "Title 0");
+  EXPECT_STREQ(cards[0].qrPayload, "payload-0");
+  EXPECT_STREQ(cards[7].title, "Title 7");
+}
+
+TEST(MagSafeBadgeStoreTest, StreamParserParsesTrailingLineWithoutNewlineAndKeepsExisting) {
+  std::array<magsafe_badge::BadgeCard, 4> cards{};
+  magsafe_badge::copyTrimmedField(cards[0].title, sizeof(cards[0].title), "existing");
+  magsafe_badge::CardsTextStreamParser<4> parser(cards, 1);
+  const std::string text = "Only|tel:+100";
+  parser.feed(text.data(), text.size());
+  EXPECT_EQ(parser.count(), 1u);
+  parser.finish();
+  ASSERT_EQ(parser.count(), 2u);
+  EXPECT_STREQ(cards[0].title, "existing");
+  EXPECT_STREQ(cards[1].title, "Only");
+  EXPECT_STREQ(cards[1].qrPayload, "tel:+100");
+}
+
+TEST(QrLayoutTest, ReservesFourModuleQuietZone) {
+  // 57-module (version 10) symbol in a 400x400 box: 65 modules incl. quiet zone -> 6 px modules.
+  const auto l = qr_layout::fit(57, 40, 100, 400, 400);
+  EXPECT_EQ(l.modulePx, 6);
+  EXPECT_EQ(l.outerSide, 65 * 6);
+  EXPECT_EQ(l.originX - l.outerX, 4 * 6);
+  EXPECT_EQ(l.originY - l.outerY, 4 * 6);
+  // Symbol + quiet zone stays inside the box and is centered.
+  EXPECT_GE(l.outerX, 40);
+  EXPECT_LE(l.outerX + l.outerSide, 440);
+  EXPECT_EQ(l.outerX - 40, 440 - (l.outerX + l.outerSide));
+
+  // Too small to fit even 1 px modules plus quiet zone.
+  EXPECT_EQ(qr_layout::fit(57, 0, 0, 60, 60).modulePx, 0);
+  EXPECT_EQ(qr_layout::fit(0, 0, 0, 100, 100).modulePx, 0);
 }
