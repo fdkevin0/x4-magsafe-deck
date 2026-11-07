@@ -79,6 +79,9 @@ x4-magsafe-deck/
 
 ### 1. Build Standalone `x4-magsafe-deck` (`app1`)
 
+Requires PlatformIO Core 6.2.0 or newer (pioarduino 55.03.312+ refuses older
+cores). Run `git submodule update --init --recursive` first.
+
 ```bash
 export PATH="$HOME/.platformio/penv/bin:$PATH"
 pio run -e x4_deck
