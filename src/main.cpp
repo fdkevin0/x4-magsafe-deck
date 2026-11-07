@@ -266,10 +266,10 @@ void renderNotificationsTab(const int pageWidth, const int pageHeight) {
   ancs::formatAncsTime(item.date, timeBuf);
   if (timeBuf[0] != '\0') {
     std::snprintf(metaLine, sizeof(metaLine), "[%u/%u]  %s   %s", static_cast<unsigned>(idx + 1),
-                  static_cast<unsigned>(g_notifCount), ancs::friendlyAppName(item.appId), timeBuf);
+                  static_cast<unsigned>(g_notifCount), ancs::displayAppName(item), timeBuf);
   } else {
     std::snprintf(metaLine, sizeof(metaLine), "[%u/%u]  %s", static_cast<unsigned>(idx + 1),
-                  static_cast<unsigned>(g_notifCount), ancs::friendlyAppName(item.appId));
+                  static_cast<unsigned>(g_notifCount), ancs::displayAppName(item));
   }
 
   int y = contentTop;

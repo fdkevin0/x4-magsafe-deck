@@ -241,7 +241,7 @@ TEST(AncsProtocolTest, HandlesZeroLengthAttributesCleanly) {
 
   ASSERT_TRUE(completed.valid);
   EXPECT_EQ(completed.uid, 7U);
-  EXPECT_STREQ(ancs::friendlyAppName(completed.appId), "Messages");
+  EXPECT_STREQ(ancs::displayAppName(completed), "MobileSMS");
   EXPECT_STREQ(completed.title, "");
   EXPECT_STREQ(completed.message, "Verification code: 849201");
 }
@@ -622,4 +622,100 @@ TEST(OtaSeqTest, PicksSlotAndWrapsAboveOtherSlot) {
   EXPECT_FALSE(p.wrapped);
   EXPECT_EQ(p.seq, 0xFFFFFFFDu);  // never 0xFFFFFFFF (erased flash)
   EXPECT_EQ((p.seq - 1) % 2, 0u);
+}
+
+TEST(AncsAppAttributesTest, BuildsRequestAndParsesFragmentedDisplayName) {
+  uint8_t pkt[ancs::kGetAppAttributesRequestMax] = {};
+  const size_t len = ancs::buildGetAppAttributesPacket("com.tencent.xin", pkt);
+  ASSERT_EQ(len, 1U + 15U + 1U + 1U);
+  EXPECT_EQ(pkt[0], static_cast<uint8_t>(ancs::CommandId::GetAppAttributes));
+  EXPECT_EQ(std::memcmp(pkt + 1, "com.tencent.xin", 16), 0);  // includes NUL
+  EXPECT_EQ(pkt[17], static_cast<uint8_t>(ancs::AppAttributeId::DisplayName));
+  EXPECT_EQ(ancs::buildGetAppAttributesPacket("", pkt), 0U);
+  const std::string tooLong(ancs::AncsNotification::kAppIdMax, 'a');
+  EXPECT_EQ(ancs::buildGetAppAttributesPacket(tooLong.c_str(), pkt), 0U);
+
+  // Response: 0x01 "com.tencent.xin\0" 0x00 len16 "微信", split at awkward boundaries.
+  std::vector<uint8_t> resp = {0x01};
+  const std::string appId = "com.tencent.xin";
+  resp.insert(resp.end(), appId.begin(), appId.end());
+  resp.push_back(0x00);
+  const std::string name = "\xE5\xBE\xAE\xE4\xBF\xA1";
+  resp.push_back(0x00);
+  resp.push_back(static_cast<uint8_t>(name.size()));
+  resp.push_back(0x00);
+  resp.insert(resp.end(), name.begin(), name.end());
+
+  EXPECT_TRUE(ancs::isAppAttributeResponseStart(resp.data(), 5, "com.tencent.xin"));
+  EXPECT_TRUE(ancs::isAppAttributeResponseStart(resp.data(), resp.size(), "com.tencent.xin"));
+  EXPECT_FALSE(ancs::isAppAttributeResponseStart(resp.data(), resp.size(), "com.tencent.xinx"));
+  EXPECT_FALSE(ancs::isAppAttributeResponseStart(resp.data(), resp.size(), "com.tencent"));
+
+  struct Result {
+    std::string appId;
+    std::string name;
+    int calls = 0;
+  } result;
+  auto cb = [](const char* id, const char* n, void* ctx) {
+    auto* r = static_cast<Result*>(ctx);
+    r->appId = id;
+    r->name = n;
+    ++r->calls;
+  };
+  ancs::AncsAppAttributeParser parser;
+  parser.reset();
+  const size_t cuts[] = {1, 7, 17, 18, 20, resp.size()};
+  size_t pos = 0;
+  for (size_t cut : cuts) {
+    parser.feed(resp.data() + pos, cut - pos, cb, &result);
+    pos = cut;
+  }
+  EXPECT_EQ(result.calls, 1);
+  EXPECT_EQ(result.appId, "com.tencent.xin");
+  EXPECT_EQ(result.name, name);
+  EXPECT_TRUE(parser.atStart());
+
+  // Wrong command id is rejected without a callback.
+  const uint8_t bad[] = {0x00, 'x', 0x00, 0x00, 0x00, 0x00};
+  parser.feed(bad, sizeof(bad), cb, &result);
+  EXPECT_EQ(result.calls, 1);
+}
+
+TEST(AncsAppAttributesTest, CacheAndDisplayNameFallback) {
+  ancs::AppNameCache<2> cache;
+  EXPECT_EQ(cache.find("com.a"), nullptr);
+  cache.put("com.a", "Alpha");
+  cache.put("com.b", "");  // iOS reported no name: cached as known-empty
+  ASSERT_NE(cache.find("com.a"), nullptr);
+  EXPECT_STREQ(cache.find("com.a"), "Alpha");
+  ASSERT_NE(cache.find("com.b"), nullptr);
+  EXPECT_STREQ(cache.find("com.b"), "");
+  cache.put("com.c", "Gamma");  // evicts the oldest entry
+  EXPECT_EQ(cache.find("com.a"), nullptr);
+  EXPECT_STREQ(cache.find("com.c"), "Gamma");
+  cache.put("com.c", "Gamma2");
+  EXPECT_STREQ(cache.find("com.c"), "Gamma2");
+  EXPECT_EQ(cache.size(), 2U);
+
+  ancs::AncsNotification item{};
+  EXPECT_STREQ(ancs::displayAppName(item), "iOS");
+  std::strcpy(item.appId, "com.apple.MobileSMS");
+  EXPECT_STREQ(ancs::displayAppName(item), "MobileSMS");
+  std::strcpy(item.appName, "Messages");
+  EXPECT_STREQ(ancs::displayAppName(item), "Messages");
+
+  ancs::NotificationList<4> list;
+  ancs::AncsNotification a{};
+  a.uid = 1;
+  a.valid = true;
+  std::strcpy(a.appId, "com.x");
+  ancs::AncsNotification b = a;
+  b.uid = 2;
+  std::strcpy(b.appId, "com.y");
+  list.upsertFront(a);
+  list.upsertFront(b);
+  EXPECT_TRUE(list.setAppName("com.x", "Ex"));
+  EXPECT_FALSE(list.setAppName("com.x", "Ex"));
+  EXPECT_STREQ(list.at(1).appName, "Ex");
+  EXPECT_STREQ(list.at(0).appName, "");
 }

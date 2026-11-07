@@ -9,6 +9,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdio>
@@ -28,6 +29,8 @@ constexpr uint32_t kDiscoveryRetryIntervalMs = 400;
 constexpr uint8_t kMaxDiscoveryRetries = 3;
 constexpr size_t kPendingQueueCap = 8;
 constexpr size_t kActionQueueCap = 4;
+constexpr size_t kAppQueueCap = 4;
+constexpr size_t kAppNameCacheCap = 12;
 
 struct PendingUidEntry {
   uint32_t uid = 0;
@@ -86,11 +89,22 @@ size_t g_actionHead = 0;
 size_t g_actionTail = 0;
 size_t g_actionCount = 0;
 
+// App identifiers waiting for a GetAppAttributes(DisplayName) request (FIFO, deduplicated).
+std::array<std::array<char, ancs::AncsNotification::kAppIdMax>, kAppQueueCap> g_pendingApps{};
+size_t g_pendingAppCount = 0;
+
+// At most one Control Point attribute request is in flight; its response arrives on Data Source.
+enum class RequestKind : uint8_t { Notification, App };
 bool g_requestInFlight = false;
+RequestKind g_inFlightKind = RequestKind::Notification;
 PendingUidEntry g_inFlightMeta{};
+std::array<char, ancs::AncsNotification::kAppIdMax> g_inFlightAppId{};
 uint32_t g_requestSentAtMs = 0;
 
 ancs::AncsDataSourceParser g_parser{};
+ancs::AncsAppAttributeParser g_appParser{};
+// Kept across reconnects: an app's display name does not change between sessions.
+ancs::AppNameCache<kAppNameCacheCap> g_appNames{};
 
 bool g_uiDirty = false;
 uint32_t g_firstDirtyMs = 0;
@@ -118,7 +132,7 @@ void removePendingUidLocked(uint32_t uid) {
   g_pendingCount = writeIdx;
   g_pendingHead = (g_pendingTail + g_pendingCount) % kPendingQueueCap;
 
-  if (g_requestInFlight && g_inFlightMeta.uid == uid) {
+  if (g_requestInFlight && g_inFlightKind == RequestKind::Notification && g_inFlightMeta.uid == uid) {
     g_requestInFlight = false;
     g_parser.reset();
   }
@@ -147,6 +161,30 @@ bool popPendingUidLocked(PendingUidEntry& out) {
   out = g_pendingUids[g_pendingTail];
   g_pendingTail = (g_pendingTail + 1) % kPendingQueueCap;
   --g_pendingCount;
+  return true;
+}
+
+void enqueueAppLocked(const char* appId) {
+  if (!appId || appId[0] == '\0' || g_appNames.find(appId)) return;
+  if (g_requestInFlight && g_inFlightKind == RequestKind::App && std::strcmp(g_inFlightAppId.data(), appId) == 0) {
+    return;
+  }
+  for (size_t i = 0; i < g_pendingAppCount; ++i) {
+    if (std::strcmp(g_pendingApps[i].data(), appId) == 0) return;
+  }
+  if (g_pendingAppCount == kAppQueueCap) return;  // retried when the app's next notification arrives
+  std::strncpy(g_pendingApps[g_pendingAppCount].data(), appId, ancs::AncsNotification::kAppIdMax - 1);
+  g_pendingApps[g_pendingAppCount][ancs::AncsNotification::kAppIdMax - 1] = '\0';
+  ++g_pendingAppCount;
+}
+
+bool popAppLocked(std::array<char, ancs::AncsNotification::kAppIdMax>& out) {
+  if (g_pendingAppCount == 0) return false;
+  out = g_pendingApps[0];
+  for (size_t i = 1; i < g_pendingAppCount; ++i) {
+    g_pendingApps[i - 1] = g_pendingApps[i];
+  }
+  --g_pendingAppCount;
   return true;
 }
 
@@ -184,6 +222,18 @@ void onNotifSourceNotify(NimBLERemoteCharacteristic*, uint8_t* data, size_t len,
 
 void onParserComplete(const ancs::AncsNotification& item, void*) {
   IosAncsService::getInstance().onAttributeComplete(item);
+}
+
+// Called with g_ancsMutex held inside onDataSourceBytes on the ble_hs task.
+void onAppParserComplete(const char* appId, const char* displayName, void*) {
+  if (!g_requestInFlight || g_inFlightKind != RequestKind::App || std::strcmp(g_inFlightAppId.data(), appId) != 0) {
+    return;
+  }
+  g_requestInFlight = false;
+  g_appNames.put(appId, displayName);
+  if (displayName[0] != '\0' && g_items.setAppName(appId, displayName)) {
+    markDirtyLocked(millis());
+  }
 }
 
 class AncsServerCallbacks : public NimBLEServerCallbacks {
@@ -416,6 +466,7 @@ bool IosAncsService::end(uint32_t timeoutMs) {
     g_needDiscovery = false;
     g_discoveryRetries = 0;
     g_requestInFlight = false;
+    g_pendingAppCount = 0;
     g_pendingCount = 0;
     g_pendingHead = 0;
     g_pendingTail = 0;
@@ -530,31 +581,57 @@ void IosAncsService::poll() {
     g_ctrlPointChr->writeValue(pkt, len, true);
   }
 
-  // 2. Check timeout on in-flight GetNotificationAttributes request and send next queued UID.
+  // 2. Check timeout on the in-flight attribute request, then send the next queued request:
+  //    notification attributes first (so new text appears quickly), then app display names.
   bool needSend = false;
+  RequestKind sendKind = RequestKind::Notification;
   PendingUidEntry nextReq{};
+  std::array<char, ancs::AncsNotification::kAppIdMax> nextApp{};
   {
     ScopedLock lock;
     if (g_connHandle == BLE_HS_CONN_HANDLE_NONE) return;
     if (g_requestInFlight && (now - g_requestSentAtMs) > kAttrRequestTimeoutMs) {
+      if (g_inFlightKind == RequestKind::App) {
+        // Remember the miss so this app is not asked about on every notification.
+        g_appNames.put(g_inFlightAppId.data(), "");
+      }
       g_requestInFlight = false;
       g_parser.reset();
+      g_appParser.reset();
     }
-    if (!g_requestInFlight && popPendingUidLocked(nextReq)) {
-      g_requestInFlight = true;
-      g_inFlightMeta = nextReq;
-      g_requestSentAtMs = now;
-      g_parser.reset();
-      needSend = true;
+    if (!g_requestInFlight) {
+      if (popPendingUidLocked(nextReq)) {
+        sendKind = RequestKind::Notification;
+        g_inFlightMeta = nextReq;
+        needSend = true;
+      } else if (popAppLocked(nextApp)) {
+        sendKind = RequestKind::App;
+        g_inFlightAppId = nextApp;
+        needSend = true;
+      }
+      if (needSend) {
+        g_requestInFlight = true;
+        g_inFlightKind = sendKind;
+        g_requestSentAtMs = now;
+        g_parser.reset();
+        g_appParser.reset();
+      }
     }
   }
 
   if (needSend && g_ctrlPointChr) {
-    uint8_t pkt[ancs::kGetAttributesRequestSize];
-    const size_t len = ancs::buildGetNotificationAttributesPacket(nextReq.uid, pkt);
-    if (!g_ctrlPointChr->writeValue(pkt, len, true)) {
+    uint8_t pkt[std::max(ancs::kGetAppAttributesRequestMax, ancs::kGetAttributesRequestSize)];
+    const size_t len = sendKind == RequestKind::Notification
+                           ? ancs::buildGetNotificationAttributesPacket(nextReq.uid, pkt)
+                           : ancs::buildGetAppAttributesPacket(nextApp.data(), pkt);
+    if (len == 0 || !g_ctrlPointChr->writeValue(pkt, len, true)) {
       ScopedLock lock;
       g_requestInFlight = false;
+      // An identifier that cannot be encoded never will be; a failed write is retried on the
+      // app's next notification.
+      if (sendKind == RequestKind::App && len == 0) {
+        g_appNames.put(nextApp.data(), "");
+      }
     }
   }
 }
@@ -665,6 +742,7 @@ void IosAncsService::onPeerDisconnect() {
     g_needDiscovery = false;
     g_discoveryRetries = 0;
     g_requestInFlight = false;
+    g_pendingAppCount = 0;
     g_pendingCount = 0;
     g_pendingHead = 0;
     g_pendingTail = 0;
@@ -672,6 +750,7 @@ void IosAncsService::onPeerDisconnect() {
     g_actionHead = 0;
     g_actionTail = 0;
     g_parser.reset();
+    g_appParser.reset();
     markDirtyLocked(millis());
   }
 }
@@ -702,6 +781,13 @@ void IosAncsService::onDataSourceBytes(const uint8_t* data, size_t len) {
   if (!g_requestInFlight) {
     return;
   }
+  if (g_inFlightKind == RequestKind::App) {
+    if (g_appParser.atStart() && !ancs::isAppAttributeResponseStart(data, len, g_inFlightAppId.data())) {
+      return;
+    }
+    g_appParser.feed(data, len, onAppParserComplete, nullptr);
+    return;
+  }
   // At a response boundary, only accept the header of the response we are waiting for. A late
   // fragment of a previously timed-out response would otherwise be parsed as a new header and could
   // desynchronize the parser for the real response.
@@ -714,7 +800,7 @@ void IosAncsService::onDataSourceBytes(const uint8_t* data, size_t len) {
 
 void IosAncsService::onAttributeComplete(const ancs::AncsNotification& parsed) {
   // Called with g_ancsMutex already held inside onDataSourceBytes on the ble_hs task.
-  if (!g_requestInFlight || g_inFlightMeta.uid != parsed.uid) {
+  if (!g_requestInFlight || g_inFlightKind != RequestKind::Notification || g_inFlightMeta.uid != parsed.uid) {
     return;
   }
   const uint8_t metaCategory = g_inFlightMeta.categoryId;
@@ -728,6 +814,12 @@ void IosAncsService::onAttributeComplete(const ancs::AncsNotification& parsed) {
   ancs::AncsNotification item = parsed;
   item.categoryId = metaCategory;
   item.eventFlags = metaFlags;
+  if (const char* cached = g_appNames.find(item.appId)) {
+    std::strncpy(item.appName, cached, sizeof(item.appName) - 1);
+    item.appName[sizeof(item.appName) - 1] = '\0';
+  } else {
+    enqueueAppLocked(item.appId);
+  }
   g_items.upsertFront(item);
   markDirtyLocked(millis());
 }

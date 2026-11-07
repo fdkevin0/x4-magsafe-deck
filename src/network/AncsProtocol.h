@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -54,6 +55,10 @@ enum class AttributeId : uint8_t {
   NegativeActionLabel = 7,
 };
 
+enum class AppAttributeId : uint8_t {
+  DisplayName = 0,
+};
+
 enum class ActionId : uint8_t {
   Positive = 0,
   Negative = 1,
@@ -72,6 +77,7 @@ struct AncsNotification {
   static constexpr size_t kTitleMax = 64;
   static constexpr size_t kMessageMax = 192;
   static constexpr size_t kDateMax = 20;
+  static constexpr size_t kAppNameMax = 32;
 
   uint32_t uid = 0;
   uint8_t categoryId = 0;
@@ -81,6 +87,8 @@ struct AncsNotification {
   char title[kTitleMax] = {0};
   char message[kMessageMax] = {0};
   char date[kDateMax] = {0};
+  // App display name from GetAppAttributes; empty until iOS has answered for this appId.
+  char appName[kAppNameMax] = {0};
 
   void clear() {
     uid = 0;
@@ -91,6 +99,7 @@ struct AncsNotification {
     title[0] = '\0';
     message[0] = '\0';
     date[0] = '\0';
+    appName[0] = '\0';
   }
 };
 
@@ -196,23 +205,189 @@ inline size_t buildPerformActionPacket(uint32_t uid, ActionId action, uint8_t ou
   return kPerformActionRequestSize;
 }
 
-// Map common iOS bundle identifiers to concise display names for the E-Ink header.
-inline const char* friendlyAppName(const char* appId) {
-  if (!appId || appId[0] == '\0') return "iOS";
-  if (std::strstr(appId, "tencent.xin")) return "WeChat";
-  if (std::strstr(appId, "MobileSMS")) return "Messages";
-  if (std::strstr(appId, "mobilephone")) return "Phone";
-  if (std::strstr(appId, "mobilemail")) return "Mail";
-  if (std::strstr(appId, "mobilecal")) return "Calendar";
-  if (std::strstr(appId, "reminders")) return "Reminders";
-  if (std::strstr(appId, "telegra")) return "Telegram";
-  if (std::strstr(appId, "whatsapp")) return "WhatsApp";
-  if (std::strstr(appId, "slack")) return "Slack";
-  if (std::strstr(appId, "dingtalk")) return "DingTalk";
-  if (std::strstr(appId, "lark") || std::strstr(appId, "feishu")) return "Feishu";
-  const char* lastDot = std::strrchr(appId, '.');
-  return (lastDot && lastDot[1] != '\0') ? (lastDot + 1) : appId;
+// GetAppAttributes Control Point request for the app's DisplayName:
+// CommandID (1) + NUL-terminated AppIdentifier + AppAttributeID DisplayName (0).
+inline constexpr size_t kGetAppAttributesRequestMax = 1 + AncsNotification::kAppIdMax + 1;
+
+// Returns the packet length, or 0 when `appId` is empty or does not fit.
+inline size_t buildGetAppAttributesPacket(const char* appId, uint8_t out[kGetAppAttributesRequestMax]) {
+  if (!appId || appId[0] == '\0') return 0;
+  const size_t idLen = std::strlen(appId);
+  if (idLen >= AncsNotification::kAppIdMax) return 0;
+  out[0] = static_cast<uint8_t>(CommandId::GetAppAttributes);
+  std::memcpy(out + 1, appId, idLen + 1);  // includes the NUL terminator
+  out[2 + idLen] = static_cast<uint8_t>(AppAttributeId::DisplayName);
+  return 3 + idLen;
 }
+
+// Whether a Data Source packet can be the first packet of the GetAppAttributes response for
+// `expectedAppId`: CommandID 1 followed by the NUL-terminated app identifier. A packet that ends
+// inside that header is accepted if its bytes match the header prefix.
+inline bool isAppAttributeResponseStart(const uint8_t* data, size_t len, const char* expectedAppId) {
+  if (!data || len == 0 || !expectedAppId) return false;
+  if (data[0] != static_cast<uint8_t>(CommandId::GetAppAttributes)) return false;
+  const size_t headerLen = std::strlen(expectedAppId) + 1;  // app id + NUL
+  const size_t cmpLen = std::min(len - 1, headerLen);
+  return std::memcmp(data + 1, expectedAppId, cmpLen) == 0;
+}
+
+// Name to show for a notification: the DisplayName iOS reported for the app, or the last
+// component of the bundle identifier until that answer arrives ("com.apple.MobileSMS" -> "MobileSMS").
+inline const char* displayAppName(const AncsNotification& item) {
+  if (item.appName[0] != '\0') return item.appName;
+  if (item.appId[0] == '\0') return "iOS";
+  const char* lastDot = std::strrchr(item.appId, '.');
+  return (lastDot && lastDot[1] != '\0') ? (lastDot + 1) : item.appId;
+}
+
+// Fixed-capacity appId -> DisplayName cache, replacing the oldest entry when full. An empty
+// name is cached too, so an app iOS reports no name for is not asked about again.
+// Not thread-safe: callers serialize access.
+template <size_t N>
+class AppNameCache {
+ public:
+  static_assert(N > 0, "AppNameCache needs capacity");
+
+  // Returns the cached name (possibly empty), or nullptr when `appId` is unknown.
+  const char* find(const char* appId) const {
+    if (!appId || appId[0] == '\0') return nullptr;
+    for (size_t i = 0; i < count_; ++i) {
+      if (std::strcmp(entries_[i].appId, appId) == 0) return entries_[i].name;
+    }
+    return nullptr;
+  }
+
+  void put(const char* appId, const char* name) {
+    if (!appId || appId[0] == '\0' || std::strlen(appId) >= AncsNotification::kAppIdMax) return;
+    Entry* slot = nullptr;
+    for (size_t i = 0; i < count_; ++i) {
+      if (std::strcmp(entries_[i].appId, appId) == 0) slot = &entries_[i];
+    }
+    if (!slot) {
+      if (count_ < N) {
+        slot = &entries_[count_++];
+      } else {
+        slot = &entries_[next_];
+        next_ = (next_ + 1) % N;
+      }
+      std::strcpy(slot->appId, appId);
+    }
+    const size_t n = name ? std::min(std::strlen(name), AncsNotification::kAppNameMax - 1) : 0;
+    if (n > 0) std::memcpy(slot->name, name, n);
+    slot->name[n] = '\0';
+    utf8SafeTruncate(slot->name, n);
+  }
+
+  size_t size() const { return count_; }
+
+ private:
+  struct Entry {
+    char appId[AncsNotification::kAppIdMax] = {0};
+    char name[AncsNotification::kAppNameMax] = {0};
+  };
+  std::array<Entry, N> entries_{};
+  size_t count_ = 0;
+  size_t next_ = 0;
+};
+
+// Byte-stream parser for the Data Source response to GetAppAttributes(DisplayName):
+// CommandID (1) + NUL-terminated AppIdentifier + {AttributeID, u16 length, value}.
+// Reassembles fragments across MTU boundaries; the value is truncated to kAppNameMax - 1 bytes
+// at a UTF-8 boundary.
+class AncsAppAttributeParser {
+ public:
+  using CompleteCallback = void (*)(const char* appId, const char* displayName, void* ctx);
+
+  void reset() {
+    phase_ = Phase::CommandId;
+    idLen_ = 0;
+    hdrPos_ = 0;
+    remaining_ = 0;
+    nameLen_ = 0;
+    appId_[0] = '\0';
+    name_[0] = '\0';
+  }
+
+  bool atStart() const { return phase_ == Phase::CommandId; }
+
+  void feed(const uint8_t* data, size_t len, CompleteCallback onComplete, void* ctx) {
+    size_t idx = 0;
+    while (idx < len) {
+      switch (phase_) {
+        case Phase::CommandId:
+          if (data[idx++] != static_cast<uint8_t>(CommandId::GetAppAttributes)) {
+            reset();
+            return;
+          }
+          phase_ = Phase::AppId;
+          break;
+        case Phase::AppId: {
+          const uint8_t b = data[idx++];
+          if (b == 0) {
+            appId_[idLen_] = '\0';
+            phase_ = Phase::AttrHeader;
+          } else if (idLen_ + 1 >= sizeof(appId_)) {
+            reset();
+            return;
+          } else {
+            appId_[idLen_++] = static_cast<char>(b);
+          }
+          break;
+        }
+        case Phase::AttrHeader:
+          hdr_[hdrPos_++] = data[idx++];
+          if (hdrPos_ == 3) {
+            hdrPos_ = 0;
+            if (hdr_[0] != static_cast<uint8_t>(AppAttributeId::DisplayName)) {
+              reset();
+              return;
+            }
+            std::memcpy(&remaining_, hdr_ + 1, sizeof(uint16_t));
+            nameLen_ = 0;
+            name_[0] = '\0';
+            if (remaining_ == 0) {
+              finish(onComplete, ctx);
+            } else {
+              phase_ = Phase::AttrPayload;
+            }
+          }
+          break;
+        case Phase::AttrPayload: {
+          const size_t consume = std::min<size_t>(len - idx, remaining_);
+          const size_t room = (sizeof(name_) - 1) - nameLen_;
+          const size_t copyLen = std::min(consume, room);
+          std::memcpy(name_ + nameLen_, data + idx, copyLen);
+          nameLen_ += copyLen;
+          name_[nameLen_] = '\0';
+          idx += consume;
+          remaining_ = static_cast<uint16_t>(remaining_ - consume);
+          if (remaining_ == 0) {
+            utf8SafeTruncate(name_, nameLen_);
+            finish(onComplete, ctx);
+          }
+          break;
+        }
+      }
+    }
+  }
+
+ private:
+  enum class Phase : uint8_t { CommandId, AppId, AttrHeader, AttrPayload };
+
+  void finish(CompleteCallback onComplete, void* ctx) {
+    if (onComplete) onComplete(appId_, name_, ctx);
+    reset();
+  }
+
+  Phase phase_ = Phase::CommandId;
+  char appId_[AncsNotification::kAppIdMax] = {0};
+  size_t idLen_ = 0;
+  uint8_t hdr_[3] = {0};
+  uint8_t hdrPos_ = 0;
+  uint16_t remaining_ = 0;
+  char name_[AncsNotification::kAppNameMax] = {0};
+  size_t nameLen_ = 0;
+};
 
 // Extract "HH:MM" from an ANCS ISO-8601 date string "yyyyMMdd'T'HHmmss".
 inline void formatAncsTime(const char* rawDate, char out[8]) {
